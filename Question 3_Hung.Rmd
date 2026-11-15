@@ -1,0 +1,2503 @@
+---
+title: "COMP3020 Social Web Analytics"
+subtitle: "Group Project - Question 3: Clustering & Visualisation"
+author: "Do Quoc Hung - 26000219"
+date: "2026-11-14"
+output:
+  word_document:
+    toc: false
+  pdf_document:
+    toc: false
+    number_sections: true
+    fig_caption: true
+  html_document:
+    toc: false
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5
+)
+
+library(tidyverse)
+library(tidytext)
+library(Matrix)
+library(cluster)
+library(knitr)
+library(irlba)
+
+set.seed(42)
+
+stopifnot(file.exists("Data/replies.csv"))
+```
+
+# Question 3 - Text Mining and Clustering Analysis
+
+## Introduction
+
+This part of the project looks at comments from the three Bluesky threads selected in Question 2 about Bad Bunny's Super Bowl halftime show.
+
+I combined the comments into one dataset and used TF-IDF to represent their text. I then used K-means clustering to group comments with similar vocabulary.
+
+To decide how many clusters to use, I compared average silhouette scores for different values of k. After clustering, I used a two-dimensional plot to show the results and compared the clusters with the original threads.
+
+I also included a short supplementary analysis to check how removing comments with limited vocabulary affects the clustering results.
+
+## Data Collection
+
+The comments were collected from Bluesky using the `atrrr` package in R. The three selected threads were labelled T1, T2 and T3.
+
+Each reply contains a unique URI, its original thread label and the comment text. The collected data was saved as `Data/replies.csv`.
+
+I used the saved CSV file for the analysis, so there was no need to connect to Bluesky again.
+
+### Bluesky Authentication
+
+During data collection, I used a Bluesky account and an app password to access the API. The credentials are not included in this report.
+
+The authentication code is shown below for reference and is not run when knitting the document.
+
+```{r q3-bluesky-auth, eval=FALSE}
+library(atrrr)
+
+atrrr::auth(
+  user = Sys.getenv("BLUESKY_USER"),
+  password = Sys.getenv("BLUESKY_APP_PASSWORD")
+)
+```
+
+## Load the Dataset
+
+I used `tidyverse` for data cleaning and plots, `tidytext` for text processing and TF-IDF, `Matrix` for the sparse document-term matrix, `cluster` for silhouette analysis and `irlba` for the two-dimensional visualisation.
+
+```{r q3-load-replies}
+replies <- read_csv(
+  "Data/replies.csv",
+  show_col_types = FALSE
+)
+
+stopifnot(
+  all(c("uri", "thread", "text") %in% names(replies)),
+  nrow(replies) > 0
+)
+
+data_overview <- replies %>%
+  summarise(
+    total_comments = n(),
+    total_threads = n_distinct(thread, na.rm = TRUE),
+    unique_comments = n_distinct(uri, na.rm = TRUE)
+  )
+
+knitr::kable(
+  data_overview,
+  caption = "Overview of collected comments"
+)
+```
+
+The dataset contains `r nrow(replies)` comments from `r n_distinct(replies$thread, na.rm = TRUE)` threads, with `r n_distinct(replies$uri, na.rm = TRUE)` unique non-missing comment IDs.
+
+Before clustering, I cleaned the text, removed duplicate comments and converted the remaining words into TF-IDF values.
+
+# Question 3. Clustering and Visualisation
+
+This question uses comments from the three Bluesky threads selected in Question 2. I used TF-IDF to represent the comment text and K-means clustering to group comments based on their vocabulary. I then visualised the clusters and compared them with the original thread labels to see whether comments from the same thread were grouped together.
+
+## Question 3a. Text Preprocessing and TF-IDF Document Term Matrix
+
+### Purpose of the Analysis
+
+The comments from T1, T2 and T3 were combined into one dataset. I cleaned the text and calculated TF-IDF values to create a Document Term Matrix (DTM). Each row represents a comment, while each column represents a word. This matrix was then used for the clustering analysis in Questions 3(b) and 3(c).
+
+### 1. Load and Examine the Collected Comments
+
+I loaded the comments from Data/replies.csv, which was collected in Question 2. Before processing the text, I checked the number of comments in each thread, missing values, duplicate comment IDs and comment lengths.
+
+```{r q3a-load-data, message=FALSE, warning=FALSE}
+# Load required packages
+library(tidyverse)
+library(tidytext)
+library(Matrix)
+library(cluster)
+library(knitr)
+
+# Load the collected comments
+replies <- readr::read_csv(
+  "Data/replies.csv",
+  show_col_types = FALSE
+)
+
+# Verify required columns
+stopifnot(
+  all(
+    c("uri", "text", "thread") %in%
+      names(replies)
+  ),
+  nrow(replies) > 0
+)
+
+# Count collected comments by original thread
+thread_counts <- replies %>%
+  count(
+    thread,
+    name = "n_replies"
+  )
+
+knitr::kable(
+  thread_counts,
+  caption = "Number of collected comments by original thread"
+)
+```
+
+### 2. Assess Data Quality
+
+I checked the dataset for missing text, empty comments and duplicate comment IDs. I also looked at comment lengths to compare the amount of text available from each thread.
+
+```{r q3a-data-quality}
+# Check missing values and duplicate identifiers
+data_quality <- replies %>%
+  summarise(
+    total_replies = n(),
+    missing_uri = sum(is.na(uri) | trimws(uri) == ""),
+    missing_thread = sum(
+      is.na(thread) | trimws(thread) == ""
+    ),
+    missing_text = sum(is.na(text)),
+    empty_text = sum(
+      is.na(text) |
+        trimws(replace_na(text, "")) == ""
+    ),
+    duplicate_uris = sum(
+      duplicated(uri) & !is.na(uri)
+    )
+  )
+
+knitr::kable(
+  data_quality,
+  caption = "Initial data quality assessment"
+)
+
+# Summarise original comment lengths by thread
+text_lengths <- replies %>%
+  mutate(
+    text_length = nchar(
+      replace_na(text, "")
+    )
+  ) %>%
+  group_by(thread) %>%
+  summarise(
+    n_comments = n(),
+    mean_length = round(
+      mean(text_length),
+      2
+    ),
+    median_length = median(text_length),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  text_lengths,
+  caption = "Comment length statistics by original thread"
+)
+```
+
+### 3. Preprocess the Comment Text
+
+The following preprocessing steps were applied:
+
+1.  Remove comments with missing identifiers, thread labels, or empty text.
+2.  Remove duplicate comments using their unique URI.
+3.  Convert the text to lowercase.
+4.  Tokenise comments into individual words.
+5.  Remove punctuation, numbers, and common English stop words.
+6.  Retain alphabetic tokens containing at least three characters.
+
+Only words containing at least three letters were kept. The token filter `^[a-z]+$` also removes words with accented characters, so some Spanish words may have been excluded from the analysis.
+
+```{r q3a-preprocessing, message=FALSE, warning=FALSE}
+# Verify that thread labels match the three selected threads
+valid_threads <- c("T1", "T2", "T3")
+
+invalid_threads <- replies %>%
+  filter(
+    !is.na(thread),
+    trimws(thread) != "",
+    !thread %in% valid_threads
+  )
+
+stopifnot(
+  nrow(invalid_threads) == 0
+)
+
+# Remove invalid and duplicate comments
+comments <- replies %>%
+  filter(
+    !is.na(uri),
+    trimws(uri) != "",
+    !is.na(thread),
+    thread %in% valid_threads,
+    !is.na(text),
+    stringr::str_trim(text) != ""
+  ) %>%
+  distinct(
+    uri,
+    .keep_all = TRUE
+  ) %>%
+  mutate(
+    comment_id = as.character(uri),
+    thread = factor(
+      thread,
+      levels = valid_threads
+    ),
+    text = stringr::str_to_lower(text)
+  )
+
+# Verify cleaned comment identifiers
+stopifnot(
+  nrow(comments) > 0,
+  !anyNA(comments$comment_id),
+  !anyDuplicated(comments$comment_id),
+  !anyNA(comments$thread)
+)
+
+# Load English stop words
+data("stop_words", package = "tidytext")
+
+# Tokenise and clean the comments
+tokens <- comments %>%
+  select(
+    comment_id,
+    thread,
+    text
+  ) %>%
+  tidytext::unnest_tokens(
+    word,
+    text
+  ) %>%
+  filter(
+    stringr::str_detect(
+      word,
+      "^[a-z]+$"
+    )
+  ) %>%
+  anti_join(
+    tidytext::stop_words,
+    by = "word"
+  ) %>%
+  filter(
+    nchar(word) >= 3
+  )
+
+# Count occurrences of each word within each comment
+word_counts <- tokens %>%
+  count(
+    comment_id,
+    word,
+    name = "n"
+  )
+
+# Verify that terms remain after preprocessing
+stopifnot(
+  nrow(word_counts) > 0
+)
+
+# Summarise preprocessing
+preprocessing_summary <- tibble(
+  Measure = c(
+    "Original collected comments",
+    "Comments after validation and deduplication",
+    "Comments removed before tokenisation",
+    "Comments with retained vocabulary",
+    "Unique retained terms"
+  ),
+  Value = c(
+    nrow(replies),
+    nrow(comments),
+    nrow(replies) - nrow(comments),
+    n_distinct(word_counts$comment_id),
+    n_distinct(word_counts$word)
+  )
+)
+
+knitr::kable(
+  preprocessing_summary,
+  caption = "Summary of comment preprocessing"
+)
+```
+
+### 4. Calculate TF-IDF Weights
+
+I used TF-IDF to measure how important each word was in a comment compared with the other comments in the dataset.
+
+TF-IDF is calculated as:
+
+$$
+TFIDF(t,d) = TF(t,d) \times IDF(t)
+$$
+
+The term frequency is:
+
+$$
+TF(t,d) =
+\frac{f(t,d)}
+{\sum_{w} f(w,d)}
+$$
+
+where $f(t,d)$ is the number of occurrences of term $t$ in document $d$, and the denominator is the total number of retained word occurrences in document $d$.
+
+Inverse document frequency is:
+
+$$
+IDF(t) =
+\ln\left(\frac{N}{df(t)}\right)
+$$
+
+where:
+
+- $N$ is the number of documents containing at least one retained term.
+- $df(t)$ is the number of documents containing term $t$.
+- $\ln$ denotes the natural logarithm.
+
+I used the `bind_tf_idf()` function from the `tidytext` package to calculate these values. Words appearing in fewer comments receive higher IDF weights, while words found in every retained document receive an IDF of zero.
+
+```{r q3a-tfidf}
+# Calculate TF-IDF weights
+tfidf_data <- word_counts %>%
+  tidytext::bind_tf_idf(
+    word,
+    comment_id,
+    n
+  )
+
+# Verify calculated weights
+stopifnot(
+  nrow(tfidf_data) > 0,
+  all(is.finite(tfidf_data$tf_idf)),
+  all(tfidf_data$tf_idf >= 0)
+)
+
+# Display the ten highest TF-IDF term-document pairs
+top_tfidf <- tfidf_data %>%
+  arrange(
+    desc(tf_idf)
+  ) %>%
+  slice_head(
+    n = 10
+  ) %>%
+  select(
+    comment_id,
+    word,
+    n,
+    tf,
+    idf,
+    tf_idf
+  )
+
+knitr::kable(
+  top_tfidf,
+  digits = 4,
+  caption = "Ten highest TF-IDF term-document weights"
+)
+```
+
+### 5. Construct the Document Term Matrix
+
+I converted the TF-IDF values into a sparse Document Term Matrix (DTM). Each row represents a comment, each column represents a word, and the values show the corresponding TF-IDF weights.
+
+I used a sparse matrix because most comments contain only a small number of words from the full vocabulary. Comments without retained words were excluded during matrix construction. I also removed rows with zero TF-IDF magnitude because these vectors cannot be L2-normalised for clustering.
+
+```{r q3a-dtm}
+# Construct the sparse TF-IDF Document Term Matrix
+dtm <- tfidf_data %>%
+  tidytext::cast_sparse(
+    comment_id,
+    word,
+    tf_idf
+  )
+
+# Count documents before removing zero vectors
+dtm_rows_before <- nrow(dtm)
+
+# Identify nonzero TF-IDF document vectors
+nonzero_rows <- Matrix::rowSums(
+  dtm^2
+) > 0
+
+# Remove zero-magnitude document vectors
+dtm <- dtm[
+  nonzero_rows,
+  ,
+  drop = FALSE
+]
+
+# Remove vocabulary columns with no remaining weights
+dtm <- dtm[
+  ,
+  Matrix::colSums(dtm != 0) > 0,
+  drop = FALSE
+]
+
+# Verify final DTM
+stopifnot(
+  nrow(dtm) > 0,
+  ncol(dtm) > 0,
+  !is.null(rownames(dtm)),
+  !anyDuplicated(rownames(dtm)),
+  all(Matrix::rowSums(dtm^2) > 0)
+)
+
+# Calculate exclusion counts
+comments_without_terms <- nrow(comments) -
+  n_distinct(word_counts$comment_id)
+
+zero_vector_comments <- dtm_rows_before -
+  nrow(dtm)
+
+# Summarise final matrix
+dtm_summary <- tibble(
+  Measure = c(
+    "Comments after validation and deduplication",
+    "Comments without retained terms",
+    "Comments with zero TF-IDF vectors",
+    "Final documents",
+    "Final vocabulary terms",
+    "Nonzero matrix entries"
+  ),
+  Value = c(
+    nrow(comments),
+    comments_without_terms,
+    zero_vector_comments,
+    nrow(dtm),
+    ncol(dtm),
+    Matrix::nnzero(dtm)
+  )
+)
+
+knitr::kable(
+  dtm_summary,
+  caption = "Final TF-IDF Document Term Matrix summary"
+)
+```
+
+### 6. Preserve Original Thread Labels
+
+I kept the original thread labels (T1, T2 and T3) so I could compare them with the clusters later in Questions 3(d) and 3(e). I also matched the comment IDs to the row order of the TF-IDF matrix to make sure each comment had the correct thread label.
+
+```{r q3a-metadata}
+# Match original metadata to final DTM rows
+comment_metadata <- comments %>%
+  select(
+    comment_id,
+    thread
+  ) %>%
+  slice(
+    match(
+      rownames(dtm),
+      comment_id
+    )
+  )
+
+# Verify exact alignment
+stopifnot(
+  nrow(comment_metadata) == nrow(dtm),
+  !anyNA(comment_metadata$comment_id),
+  !anyNA(comment_metadata$thread),
+  identical(
+    as.character(comment_metadata$comment_id),
+    rownames(dtm)
+  )
+)
+
+# Summarise retained comments by thread
+retained_thread_counts <- comment_metadata %>%
+  count(
+    thread,
+    name = "n_comments",
+    .drop = FALSE
+  )
+
+knitr::kable(
+  retained_thread_counts,
+  caption = "Final retained comments by original thread"
+)
+```
+
+### 7. Save the Preprocessing Results
+
+The TF-IDF weights, document metadata, and sparse Document Term Matrix were saved for reproducibility and use in subsequent questions.
+
+```{r q3a-save-results, include=FALSE}
+# Save TF-IDF weights
+readr::write_csv(
+  tfidf_data,
+  "Data/q3_tfidf.csv"
+)
+
+# Save aligned comment metadata
+readr::write_csv(
+  comment_metadata,
+  "Data/q3_comment_metadata.csv"
+)
+
+# Save sparse TF-IDF matrix
+saveRDS(
+  dtm,
+  "Data/q3_dtm.rds"
+)
+
+# Verify saved files
+stopifnot(
+  file.exists("Data/q3_tfidf.csv"),
+  file.exists("Data/q3_comment_metadata.csv"),
+  file.exists("Data/q3_dtm.rds")
+)
+```
+
+### **Interpretation**
+
+> The original dataset contained `r nrow(replies)` comments from the three Bluesky threads. After removing missing records and duplicate IDs, `r nrow(comments)` comments remained. During text preprocessing, `r comments_without_terms` comments were excluded because they had no retained words. Another `r zero_vector_comments` comments were removed because their TF-IDF vectors had zero magnitude. The final TF-IDF matrix contained `r nrow(dtm)` comments and `r ncol(dtm)` vocabulary terms, with `r Matrix::nnzero(dtm)` nonzero values. Each row represents a comment, while the columns represent the words found in the dataset. The TF-IDF values show how important each word is relative to the other comments. I used this matrix for clustering in Questions 3(b) and 3(c). The original thread labels were kept separately for the visualisation and comparison in Questions 3(d) and 3(e).
+
+## Question 3b. Determining the Optimal Number of Clusters
+
+### Purpose of the Analysis
+
+I used the TF-IDF matrix from Question 3(a) to find a suitable number of clusters for the combined comments. I tested values from $k=2$ to $k=10$ and compared their average silhouette scores using cosine distance. The value of $k$ with the highest average score was selected.
+
+### 1. Normalise the TF-IDF Document Vectors
+
+Before clustering, I converted the TF-IDF matrix into a numerical matrix and normalised each comment vector to have a length of 1.
+
+For document vector $\mathbf{x}_i$, L2 normalisation is defined as:
+
+$$
+\mathbf{x}_i^* =
+\frac{\mathbf{x}_i}{\|\mathbf{x}_i\|_2}
+$$
+
+where $\|\mathbf{x}_i\|_2$ is the Euclidean norm of the original TF-IDF vector.
+
+I used normalisation to reduce the effect of differences in vector length and focus more on the relative TF-IDF weights of the words.
+
+```{r q3b-normalisation, message=FALSE, warning=FALSE}
+# Convert the sparse TF-IDF matrix into a numerical matrix
+X <- as.matrix(dtm)
+
+# Preserve original comment identifiers
+stopifnot(
+  !is.null(rownames(X)),
+  identical(rownames(X), rownames(dtm))
+)
+
+# Calculate the Euclidean norm of each document vector
+row_lengths <- sqrt(
+  rowSums(X^2)
+)
+
+# Confirm all document vectors have nonzero magnitude
+stopifnot(
+  all(is.finite(row_lengths)),
+  all(row_lengths > 0)
+)
+
+# Apply L2 normalisation
+X_norm <- sweep(
+  X,
+  1,
+  row_lengths,
+  FUN = "/"
+)
+
+# Verify unit-length vectors
+normalised_lengths <- sqrt(
+  rowSums(X_norm^2)
+)
+
+stopifnot(
+  all(abs(normalised_lengths - 1) < 1e-8),
+  identical(rownames(X_norm), rownames(dtm))
+)
+
+# Summarise the normalised matrix
+normalisation_summary <- tibble(
+  Measure = c(
+    "Number of comments",
+    "Number of TF-IDF features",
+    "Minimum normalised vector length",
+    "Maximum normalised vector length"
+  ),
+  Value = c(
+    as.character(nrow(X_norm)),
+    as.character(ncol(X_norm)),
+    sprintf("%.6f", min(normalised_lengths)),
+    sprintf("%.6f", max(normalised_lengths))
+  )
+)
+
+knitr::kable(
+  normalisation_summary,
+  caption = "Summary of L2-normalised TF-IDF vectors"
+)
+```
+
+### 2. Calculate Cosine Distances
+
+I used cosine distance to compare the vocabulary patterns between comments.
+
+For two L2-normalised document vectors, cosine distance is calculated as:
+
+$$
+d_{\cos}(i,j) =
+1-\mathbf{x}_i^{*T}\mathbf{x}_j^*
+$$
+
+A smaller distance means the comments have more similar TF-IDF representations.
+
+I chose cosine distance because the analysis focuses on similarities in word usage rather than the original lengths of the document vectors.
+
+K-means uses squared Euclidean distance to form clusters. I used cosine distance separately when calculating silhouette scores to evaluate the resulting clusters.
+
+```{r q3b-cosine-distance}
+# Calculate pairwise cosine distances
+cosine_distance_matrix <- 1 - tcrossprod(X_norm)
+
+# Correct minor numerical rounding errors
+cosine_distance_matrix <- pmax(
+  cosine_distance_matrix,
+  0
+)
+
+# Ensure a zero diagonal and matrix symmetry
+cosine_distance_matrix <- (
+  cosine_distance_matrix +
+    t(cosine_distance_matrix)
+) / 2
+
+diag(cosine_distance_matrix) <- 0
+
+# Convert the matrix into a distance object
+cosine_dist <- stats::as.dist(
+  cosine_distance_matrix
+)
+
+# Verify calculated distances
+stopifnot(
+  all(is.finite(cosine_distance_matrix)),
+  all(cosine_distance_matrix >= 0),
+  max(
+    abs(
+      cosine_distance_matrix -
+        t(cosine_distance_matrix)
+    )
+  ) < 1e-8
+)
+```
+
+### 3. Evaluate Candidate Cluster Numbers
+
+I used silhouette scores to check how well the comments were grouped for each value of (k). The score compares how close a comment is to others in its own cluster with how close it is to comments in the nearest alternative cluster.
+
+For observation $i$, the silhouette coefficient is:
+
+$$
+s(i) =
+\frac{b(i)-a(i)}
+{\max(a(i),b(i))}
+$$
+
+where:
+
+- $a(i)$ is the average distance between observation $i$ and other observations in its assigned cluster.
+- $b(i)$ is the minimum average distance between observation $i$ and observations in another cluster.
+
+The average silhouette score for (k) clusters is:
+
+$$
+\bar{s}(k) =
+\frac{1}{N}
+\sum_{i=1}^{N}s(i)
+$$
+
+where $N$ represents the total number of comments.
+
+Silhouette scores range from -1 to 1. A positive score suggests a comment fits better in its assigned cluster. Scores close to zero indicate weak separation between clusters, while negative scores suggest the comment is closer to another cluster.
+
+I tested nine values of $k$, from $k=2$ to $k=10$.
+
+For each value, I ran K-means with 25 random starts, a maximum of 300 iterations and a random seed of 42.
+
+```{r q3b-cluster-evaluation, message=FALSE, warning=FALSE}
+# Define candidate numbers of clusters
+k_values <- 2:10
+
+# Verify the dataset supports the candidate range
+stopifnot(
+  nrow(X_norm) > max(k_values)
+)
+
+# Count distinct normalised document vectors
+n_distinct_vectors <- nrow(
+  unique(
+    as.data.frame(X_norm)
+  )
+)
+
+stopifnot(
+  n_distinct_vectors >= max(k_values)
+)
+
+# Evaluate K-means solutions using cosine silhouettes
+silhouette_results <- purrr::map_dfr(
+  k_values,
+  function(k) {
+
+    set.seed(42)
+
+    model <- stats::kmeans(
+      X_norm,
+      centers = k,
+      nstart = 25,
+      iter.max = 300
+    )
+
+    # Calculate cosine-distance silhouette coefficients
+    sil <- cluster::silhouette(
+      model$cluster,
+      cosine_dist
+    )
+
+    tibble(
+      k = k,
+      avg_silhouette = mean(
+        sil[, "sil_width"]
+      ),
+      total_wss = model$tot.withinss
+    )
+  }
+)
+
+# Verify the evaluation results
+stopifnot(
+  nrow(silhouette_results) == length(k_values),
+  all(is.finite(silhouette_results$avg_silhouette)),
+  all(is.finite(silhouette_results$total_wss))
+)
+
+# Display candidate results
+knitr::kable(
+  silhouette_results,
+  digits = 4,
+  col.names = c(
+    "Number of Clusters (k)",
+    "Average Silhouette Score",
+    "Total Within-Cluster Sum of Squares"
+  ),
+  caption = "Comparison of candidate K-means clustering solutions"
+)
+```
+
+### 4. Select the Optimal Number of Clusters
+
+I selected the value of (k) with the highest average silhouette score:
+
+$$
+k^* =
+\underset{k \in \{2,\ldots,10\}}{\arg\max}
+\ \bar{s}(k)
+$$
+
+This gives the best-performing number of clusters among the nine values tested. I also compared the highest score with the second-highest score to see how much difference there was between the two solutions.
+
+```{r q3b-select-k}
+# Rank candidate solutions by average silhouette score
+ranked_results <- silhouette_results %>%
+  arrange(
+    desc(avg_silhouette),
+    k
+  )
+
+# Extract the best candidate
+best_k <- ranked_results$k[[1]]
+
+best_score <- ranked_results$avg_silhouette[[1]]
+
+# Extract the second-best candidate
+second_best_k <- ranked_results$k[[2]]
+
+second_best_score <- ranked_results$avg_silhouette[[2]]
+
+# Calculate the difference between the top two scores
+score_difference <- best_score - second_best_score
+
+# Display selection results
+selection_summary <- tibble(
+  Measure = c(
+    "Selected number of clusters",
+    "Highest average silhouette score",
+    "Second-best number of clusters",
+    "Second-highest silhouette score",
+    "Difference between top two scores"
+  ),
+  Value = c(
+    as.character(best_k),
+    sprintf("%.4f", best_score),
+    as.character(second_best_k),
+    sprintf("%.4f", second_best_score),
+    sprintf("%.4f", score_difference)
+  )
+)
+
+knitr::kable(
+  selection_summary,
+  caption = "Optimal cluster selection summary"
+)
+```
+
+### 5. Visualise the Silhouette Evaluation
+
+The line chart below shows the average silhouette score for each value of $k$ from 2 to 10. The dashed vertical line marks the selected number of clusters.
+
+```{r q3b-silhouette-plot, fig.width=8, fig.height=5, fig.cap="Average cosine-distance silhouette scores for K-means clustering with k = 2 to 10."}
+p_silhouette <- ggplot(
+  silhouette_results,
+  aes(
+    x = k,
+    y = avg_silhouette
+  )
+) +
+  geom_line(
+    linewidth = 0.8,
+    colour = "#2563A6"
+  ) +
+  geom_point(
+    size = 2.5,
+    colour = "#2563A6"
+  ) +
+  geom_vline(
+    xintercept = best_k,
+    linetype = "dashed",
+    colour = "#D1495B"
+  ) +
+  geom_point(
+    data = silhouette_results %>%
+      filter(k == best_k),
+    size = 3.5,
+    colour = "#D1495B"
+  ) +
+  scale_x_continuous(
+    breaks = k_values
+  ) +
+  labs(
+    title = "Optimal Number of Clusters",
+    subtitle = "Average silhouette scores using cosine distance",
+    x = "Number of Clusters (k)",
+    y = "Average Silhouette Score"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p_silhouette)
+
+# Save the figure
+ggsave(
+  "Data/q3_silhouette_plot.png",
+  plot = p_silhouette,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```
+
+### 6. Examine the Selected Solution
+
+After selecting the number of clusters, I checked how many comments had negative silhouette scores. A negative score means a comment is closer, on average, to another cluster than to its assigned cluster.
+
+I also ran K-means again using the selected value of (k), with the same random seed and settings, to check the selected solution.
+
+```{r q3b-selected-diagnostics}
+# Refit the selected candidate using identical parameters
+set.seed(42)
+
+selected_model <- stats::kmeans(
+  X_norm,
+  centers = best_k,
+  nstart = 25,
+  iter.max = 300
+)
+
+# Calculate individual silhouette coefficients
+selected_silhouette <- cluster::silhouette(
+  selected_model$cluster,
+  cosine_dist
+)
+
+# Summarise the selected solution
+selected_avg_silhouette <- mean(
+  selected_silhouette[, "sil_width"]
+)
+
+negative_silhouette_pct <- 100 * mean(
+  selected_silhouette[, "sil_width"] < 0
+)
+
+# Verify consistency with the selected score
+stopifnot(
+  abs(selected_avg_silhouette - best_score) < 1e-8
+)
+
+selected_diagnostics <- tibble(
+  Measure = c(
+    "Selected number of clusters",
+    "Average silhouette score",
+    "Comments with negative silhouette (%)"
+  ),
+  Value = c(
+    as.character(best_k),
+    sprintf("%.4f", selected_avg_silhouette),
+    sprintf("%.2f", negative_silhouette_pct)
+  )
+)
+
+knitr::kable(
+  selected_diagnostics,
+  caption = "Silhouette diagnostics for the selected solution"
+)
+```
+
+### 7. Save the Evaluation Results
+
+The silhouette evaluation results were saved for reproducibility and subsequent analysis.
+
+```{r q3b-save-results, include=FALSE}
+readr::write_csv(
+  silhouette_results,
+  "Data/q3_silhouette_results.csv"
+)
+
+stopifnot(
+  file.exists("Data/q3_silhouette_results.csv"),
+  file.exists("Data/q3_silhouette_plot.png")
+)
+```
+
+### **Interpretation**
+
+> I tested nine clustering solutions, ranging from $k=2$ to $k=10$. The highest average silhouette score was `r round(best_score, 4)`, at $k=`r best_k`$. The second-highest score was `r round(second_best_score, 4)`, at $k=`r second_best_k`$, giving a difference of`r round(score_difference, 4)`. For the selected solution, `r round(negative_silhouette_pct, 2)`% of comments had negative silhouette scores. `r if (best_score > 0.5) {   "The score suggests relatively clear separation between clusters." } else if (best_score > 0.25) {   "The score suggests some separation, although the clusters still overlap." } else {   "The score suggests weak separation, with considerable overlap between clusters." }` The selected value of $k$ had the highest average silhouette score among the values tested. This does not mean the clusters are completely separate or that another value outside the tested range would perform worse. Some overlap is reasonable given the short comments and similar vocabulary used across the threads. The selected value of $k=`r best_k`$ will be utilised consistently in Question 3(c) to fit the final K-means model.
+
+## Question 3c. K-means Clustering and Cluster Interpretation
+
+### Choice of Clustering Technique
+
+I used K-means to group the comments based on their TF-IDF values. The document vectors were already L2-normalised in Question 3(b), so I used the same data for the final clustering.
+
+K-means works by assigning comments to clusters and minimising the squared Euclidean distances between each comment and its cluster centre.
+
+The objective function is:
+
+$$
+J = \sum_{j=1}^{k}
+\sum_{\mathbf{x}_i \in C_j}
+\|\mathbf{x}_i-\boldsymbol{\mu}_j\|^2
+$$
+
+where:
+
+- $C_j$ represents cluster $j$.
+- $\mathbf{x}_i$ is the normalised TF-IDF vector of comment $i$.
+- $\boldsymbol{\mu}_j$ is the centroid of cluster $j$.
+- $k$ is the selected number of clusters.
+
+I chose K-means because we covered this method in the subject and it works with numerical document vectors. I used $k=`r best_k`$, which gave the highest average silhouette score in Question 3(b).
+
+The final model used the following parameters:
+
+- `centers = best_k`: The selected number of clusters.
+- `nstart = 25`: 25 random initialisations to reduce sensitivity to starting centroids.
+- `iter.max = 300`: Maximum number of iterations per initialisation.
+- `set.seed(42)`: Fixed random seed for reproducibility.
+
+K-means uses squared Euclidean distance to form the clusters. Cosine distance was used separately to evaluate them using silhouette scores.
+
+### 1. Fit the Final K-means Model
+
+```{r q3c-final-kmeans, message=FALSE, warning=FALSE}
+# Verify alignment with the original TF-IDF matrix
+stopifnot(
+  nrow(X_norm) == nrow(dtm),
+  nrow(comment_metadata) == nrow(dtm),
+  identical(rownames(X_norm), rownames(dtm)),
+  identical(
+    as.character(comment_metadata$comment_id),
+    rownames(dtm)
+  )
+)
+
+# Fit K-means using the same parameters as Question 3(b)
+set.seed(42)
+
+final_kmeans <- stats::kmeans(
+  X_norm,
+  centers = best_k,
+  nstart = 25,
+  iter.max = 300
+)
+
+# Calculate silhouette scores using cosine distance
+final_silhouette <- cluster::silhouette(
+  final_kmeans$cluster,
+  cosine_dist
+)
+
+final_avg_silhouette <- mean(
+  final_silhouette[, "sil_width"]
+)
+
+# Verify consistency with Question 3(b)
+stopifnot(
+  abs(final_avg_silhouette - best_score) < 1e-8
+)
+
+# Attach cluster labels to original comment metadata
+cluster_assignments <- comment_metadata %>%
+  mutate(
+    cluster = factor(
+      final_kmeans$cluster,
+      levels = seq_len(best_k)
+    ),
+    silhouette = as.numeric(
+      final_silhouette[, "sil_width"]
+    )
+  )
+
+# Verify original comment alignment
+stopifnot(
+  nrow(cluster_assignments) == nrow(dtm),
+  !anyDuplicated(cluster_assignments$comment_id),
+  !anyNA(cluster_assignments$cluster),
+  !anyNA(cluster_assignments$thread)
+)
+
+# Display model summary
+model_summary <- tibble(
+  Measure = c(
+    "Number of comments",
+    "Number of TF-IDF features",
+    "Selected clusters",
+    "Total within-cluster sum of squares",
+    "Average silhouette score"
+  ),
+  Value = c(
+    as.character(nrow(X_norm)),
+    as.character(ncol(X_norm)),
+    as.character(best_k),
+    sprintf("%.4f", final_kmeans$tot.withinss),
+    sprintf("%.4f", final_avg_silhouette)
+  )
+)
+
+knitr::kable(
+  model_summary,
+  caption = "Final K-means clustering summary"
+)
+```
+
+### 2. Examine Cluster Sizes
+
+I counted the comments in each cluster to see how they were distributed across the groups.
+
+```{r q3c-cluster-sizes}
+cluster_sizes <- cluster_assignments %>%
+  count(
+    cluster,
+    name = "n_comments",
+    .drop = FALSE
+  ) %>%
+  mutate(
+    percentage = round(
+      100 * n_comments / sum(n_comments),
+      2
+    )
+  )
+
+knitr::kable(
+  cluster_sizes,
+  digits = 2,
+  caption = "Distribution of comments across clusters"
+)
+```
+
+### 3. Identify Important Terms in Each Cluster
+
+I calculated the average TF-IDF weight of each word across the comments in each cluster, including zero weights for comments where the word did not appear.
+
+I used these averages to identify the words with the highest TF-IDF weights in each cluster and help interpret the differences between the groups.
+
+```{r q3c-top-terms}
+# Calculate the number of documents in each cluster
+cluster_document_counts <- cluster_assignments %>%
+  count(cluster, name = "n_documents")
+
+# Calculate total TF-IDF weight for each term by cluster
+cluster_terms <- tfidf_data %>%
+  inner_join(
+    cluster_assignments %>%
+      select(comment_id, cluster),
+    by = "comment_id"
+  ) %>%
+  group_by(cluster, word) %>%
+  summarise(
+    total_tfidf = sum(tf_idf),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    cluster_document_counts,
+    by = "cluster"
+  ) %>%
+  mutate(
+    mean_tfidf = total_tfidf / n_documents
+  ) %>%
+  group_by(cluster) %>%
+  slice_max(
+    mean_tfidf,
+    n = 10,
+    with_ties = FALSE
+  ) %>%
+  arrange(
+    cluster,
+    desc(mean_tfidf)
+  ) %>%
+  ungroup() %>%
+  select(
+    cluster,
+    word,
+    mean_tfidf
+  )
+
+knitr::kable(
+  cluster_terms,
+  digits = 4,
+  caption = "Top ten terms by mean TF-IDF weight in each cluster"
+)
+```
+
+### 4. Examine Representative Comments
+
+I selected five comments with the highest silhouette scores from each cluster to help understand what the groups were discussing.
+
+These comments were more closely associated with their assigned clusters than with other clusters based on cosine distance. However, a high silhouette score does not necessarily mean a comment is closest to its cluster centre.
+
+```{r q3c-representative-comments}
+# Recover original comment text
+original_comments <- replies %>%
+  transmute(
+    comment_id = as.character(uri),
+    text
+  ) %>%
+  filter(
+    !is.na(comment_id),
+    !is.na(text)
+  ) %>%
+  distinct(
+    comment_id,
+    .keep_all = TRUE
+  )
+
+# Join cluster assignments to original comments
+cluster_examples <- cluster_assignments %>%
+  left_join(
+    original_comments,
+    by = "comment_id"
+  )
+
+# Verify one-to-one matching
+stopifnot(
+  nrow(cluster_examples) == nrow(cluster_assignments),
+  !anyNA(cluster_examples$text)
+)
+
+# Select five high-silhouette comments per cluster
+representative_comments <- cluster_examples %>%
+  group_by(cluster) %>%
+  slice_max(
+    silhouette,
+    n = 5,
+    with_ties = FALSE
+  ) %>%
+  ungroup() %>%
+  arrange(
+    cluster,
+    desc(silhouette)
+  )
+
+knitr::kable(
+  representative_comments %>%
+    select(
+      cluster,
+      thread,
+      silhouette,
+      text
+    ),
+  digits = 4,
+  caption = "Five high-silhouette comments from each cluster"
+)
+```
+
+### 5. Visualise Cluster Distribution
+
+```{r q3c-cluster-sizes-plot, fig.width=8, fig.height=5, fig.cap="Percentage of comments assigned to each K-means cluster."}
+p_cluster_sizes <- ggplot(
+  cluster_sizes,
+  aes(
+    x = cluster,
+    y = percentage
+  )
+) +
+  geom_col(
+    fill = "#457B9D",
+    width = 0.7
+  ) +
+  geom_text(
+    aes(label = paste0(percentage, "%")),
+    vjust = -0.3,
+    size = 3
+  ) +
+  expand_limits(
+    y = max(cluster_sizes$percentage) * 1.12
+  ) +
+  labs(
+    title = "Distribution of Comments Across Clusters",
+    subtitle = paste(
+      "K-means clustering, k =",
+      best_k
+    ),
+    x = "Cluster",
+    y = "Percentage of Comments"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p_cluster_sizes)
+```
+
+### 6. Save Clustering Results
+
+```{r q3c-save-results, include=FALSE}
+# Save original cluster assignments
+readr::write_csv(
+  cluster_assignments,
+  "Data/q3_cluster_assignments.csv"
+)
+
+# Save cluster sizes
+readr::write_csv(
+  cluster_sizes,
+  "Data/q3_cluster_sizes.csv"
+)
+
+# Save top terms
+readr::write_csv(
+  cluster_terms,
+  "Data/q3_cluster_top_terms.csv"
+)
+
+# Save representative comments
+readr::write_csv(
+  representative_comments,
+  "Data/q3_cluster_examples.csv"
+)
+
+# Save fitted model
+saveRDS(
+  final_kmeans,
+  "Data/q3_final_kmeans_model.rds"
+)
+```
+
+### **Cluster Interpretation**
+
+> The final K-means model divided `r nrow(cluster_assignments)` comments into `r best_k` clusters using L2-normalised TF-IDF vectors. The largest cluster contained `r max(cluster_sizes$n_comments)` comments, representing `r round(100 * max(cluster_sizes$n_comments) / nrow(cluster_assignments), 2)`% of the dataset. The smallest cluster contained `r min(cluster_sizes$n_comments)` comments. The average silhouette score was `r round(final_avg_silhouette, 4)`, which gives an indication of how well the clusters were separated using cosine distance. I looked at the highest-ranked TF-IDF words and representative comments to understand the content of each cluster. Some comments might still share similar vocabulary across different clusters, since K-means assigns every comment to a group even when the groups overlap. I kept the original thread labels and cluster assignments for the 2D visualisation in Question 3(d) and the comparison between threads and clusters in Question 3(e).
+
+## Question 3d. Two-Dimensional Cluster Visualisation
+
+### Purpose of the Visualisation
+
+In Question 3(c), I used K-means to group comments based on their TF-IDF values. Since the TF-IDF matrix contains many words, I needed to reduce the data to two dimensions to display the clusters in a scatter plot.
+
+I used truncated Singular Value Decomposition (SVD) to reduce the normalised TF-IDF matrix to two dimensions.
+
+In the plot, different colours represent the K-means clusters, while different shapes represent the original threads (T1, T2 and T3).
+
+I kept the cluster assignments from Question 3(c) unchanged. SVD was only used to create the visualisation.
+
+### 1. Prepare and Verify the Clustering Data
+
+I used the same L2-normalised TF-IDF matrix (`X_norm`) from Question 3(c), along with the comment IDs, cluster assignments and thread labels stored in `cluster_assignments`.
+
+I checked the comment IDs to make sure each plotted point matched the correct comment and its labels.
+
+```{r q3d-prepare-data, message=FALSE, warning=FALSE}
+# Verify that the normalised matrix and original DTM match
+stopifnot(
+  nrow(X_norm) == nrow(dtm),
+  ncol(X_norm) == ncol(dtm),
+  identical(
+    rownames(X_norm),
+    rownames(dtm)
+  ),
+  !is.null(rownames(X_norm)),
+  !anyDuplicated(rownames(X_norm))
+)
+
+# Verify the original cluster assignments
+stopifnot(
+  all(
+    c("comment_id", "thread", "cluster") %in%
+      names(cluster_assignments)
+  ),
+  !anyDuplicated(cluster_assignments$comment_id),
+  !anyNA(cluster_assignments$comment_id),
+  !anyNA(cluster_assignments$thread),
+  !anyNA(cluster_assignments$cluster)
+)
+
+# Match metadata to the exact matrix row order
+plot_data <- cluster_assignments %>%
+  slice(
+    match(
+      rownames(X_norm),
+      comment_id
+    )
+  )
+
+# Confirm correct document alignment
+stopifnot(
+  nrow(plot_data) == nrow(X_norm),
+  !anyNA(plot_data$comment_id),
+  identical(
+    as.character(plot_data$comment_id),
+    rownames(X_norm)
+  ),
+  all(
+    as.character(plot_data$thread) %in%
+      c("T1", "T2", "T3")
+  ),
+  dplyr::n_distinct(plot_data$cluster) == best_k
+)
+
+# Summarise the visualisation dataset
+visual_summary <- tibble(
+  Measure = c(
+    "Total comments",
+    "TF-IDF vocabulary features",
+    "Number of K-means clusters",
+    "Number of original threads"
+  ),
+  Value = c(
+    nrow(X_norm),
+    ncol(X_norm),
+    dplyr::n_distinct(plot_data$cluster),
+    dplyr::n_distinct(plot_data$thread)
+  )
+)
+
+knitr::kable(
+  visual_summary,
+  caption = "Summary of the 2D visualisation dataset"
+)
+```
+
+### 2. Reduce the TF-IDF Matrix to Two Dimensions
+
+Truncated Singular Value Decomposition was applied to the L2-normalised TF-IDF matrix.
+
+SVD decomposes a matrix $A$ as:
+
+$$
+A = U\Sigma V^T
+$$
+
+where:
+
+- $U$ contains the left singular vectors associated with documents.
+- $\Sigma$ contains the singular values.
+- $V^T$ contains the right singular vectors associated with vocabulary features.
+
+I kept the first two components and calculated the coordinates as:
+
+$$
+Z_2 = U_2\Sigma_2
+$$
+
+where $Z_2$ contains the coordinates of each comment along the first two SVD components.
+
+SVD reduces the number of features while retaining some of the original data structure. Unlike standard PCA, truncated SVD does not require centring the data by subtracting the feature means.
+
+```{r q3d-svd, message=FALSE, warning=FALSE}
+# Check that the irlba package is available
+if (!requireNamespace("irlba", quietly = TRUE)) {
+  stop(
+    "Please install irlba using install.packages('irlba')"
+  )
+}
+
+# Ensure the matrix supports two-dimensional reduction
+stopifnot(
+  nrow(X_norm) > 2,
+  ncol(X_norm) > 2
+)
+
+# Apply truncated SVD to the normalised TF-IDF matrix
+set.seed(42)
+
+svd_result <- irlba::irlba(
+  X_norm,
+  nv = 2,
+  nu = 2
+)
+
+# Calculate two-dimensional document coordinates
+coordinates <- sweep(
+  svd_result$u,
+  2,
+  svd_result$d,
+  FUN = "*"
+)
+
+colnames(coordinates) <- c(
+  "SVD1",
+  "SVD2"
+)
+
+# Verify coordinate dimensions and values
+stopifnot(
+  nrow(coordinates) == nrow(X_norm),
+  ncol(coordinates) == 2,
+  all(is.finite(coordinates))
+)
+
+# Calculate the proportion of total squared matrix
+# magnitude represented by the first two components
+component_proportions <- svd_result$d^2 /
+  sum(X_norm^2)
+
+svd_information <- tibble(
+  Component = c(
+    "SVD Component 1",
+    "SVD Component 2",
+    "Combined"
+  ),
+  Proportion = c(
+    component_proportions[1],
+    component_proportions[2],
+    sum(component_proportions)
+  ),
+  Percentage = round(
+    100 * c(
+      component_proportions[1],
+      component_proportions[2],
+      sum(component_proportions)
+    ),
+    2
+  )
+)
+
+knitr::kable(
+  svd_information,
+  digits = 4,
+  caption = "Proportion of squared TF-IDF matrix magnitude represented by the SVD components"
+)
+```
+
+### 3. Combine Coordinates with Cluster and Thread Labels
+
+I combined the two-dimensional coordinates with the original comment information.
+
+Each point in the scatter plot represents one comment. Its colour shows the assigned K-means cluster, while its shape shows which thread the comment originally came from.
+
+```{r q3d-combine-coordinates}
+# Attach SVD coordinates to the aligned metadata
+plot_data <- plot_data %>%
+  mutate(
+    SVD1 = coordinates[, 1],
+    SVD2 = coordinates[, 2],
+    cluster = factor(
+      cluster,
+      levels = as.character(seq_len(best_k))
+    ),
+    thread = factor(
+      thread,
+      levels = c("T1", "T2", "T3")
+    )
+  )
+
+# Verify all labels and coordinates
+stopifnot(
+  !anyNA(plot_data$SVD1),
+  !anyNA(plot_data$SVD2),
+  !anyNA(plot_data$cluster),
+  !anyNA(plot_data$thread),
+  nrow(plot_data) == nrow(X_norm)
+)
+
+# Summarise comments by original thread
+thread_visual_summary <- plot_data %>%
+  count(
+    thread,
+    name = "n_comments",
+    .drop = FALSE
+  )
+
+knitr::kable(
+  thread_visual_summary,
+  caption = "Comments included in the 2D visualisation by original thread"
+)
+```
+
+### 4. Visualise the K-means Clusters in Two Dimensions
+
+The scatter plot below shows the comments using the first two SVD components.
+
+I used different colours for the K-means clusters and different shapes for the original threads (T1, T2 and T3).
+
+The coordinates were calculated from the normalised TF-IDF matrix. I kept the original cluster assignments without running K-means again.
+
+```{r q3d-visualisation, fig.width=11, fig.height=7, fig.cap="Two-dimensional truncated SVD projection of L2-normalised TF-IDF comments. Colours indicate K-means clusters and shapes indicate original thread labels."}
+# Create the two-dimensional cluster visualisation
+p_2d <- ggplot(
+  plot_data,
+  aes(
+    x = SVD1,
+    y = SVD2,
+    colour = cluster,
+    shape = thread
+  )
+) +
+  geom_point(
+    size = 2.2,
+    alpha = 0.7,
+    stroke = 0.4
+  ) +
+  scale_shape_manual(
+    values = c(
+      T1 = 16,
+      T2 = 17,
+      T3 = 15
+    ),
+    drop = FALSE
+  ) +
+  guides(
+    colour = guide_legend(
+      override.aes = list(
+        size = 3,
+        alpha = 1
+      )
+    ),
+    shape = guide_legend(
+      override.aes = list(
+        size = 3,
+        alpha = 1
+      )
+    )
+  ) +
+  labs(
+    title = "2D Visualisation of K-means Clusters",
+    subtitle = paste(
+      "Truncated SVD of normalised TF-IDF vectors, k =",
+      best_k
+    ),
+    x = "SVD Component 1",
+    y = "SVD Component 2",
+    colour = "K-means Cluster",
+    shape = "Original Thread"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(
+      face = "bold"
+    ),
+    panel.grid.minor = element_blank()
+  )
+
+# Display the figure
+print(p_2d)
+
+# Save the figure
+ggsave(
+  "Data/q3_2d_clusters_threads.png",
+  plot = p_2d,
+  width = 11,
+  height = 7,
+  dpi = 300
+)
+```
+
+### **Interpretation of the 2D Visualisation**
+
+> The two-dimensional visualisation contains `r nrow(plot_data)` comments assigned to `r dplyr::n_distinct(plot_data$cluster)` K-means clusters and originating from `r dplyr::n_distinct(plot_data$thread)` discussion threads. The first two SVD components represent approximately `r round(100 * sum(component_proportions), 2)`% of the total squared magnitude of the normalised TF-IDF matrix. This measures how much of the original matrix is represented in two dimensions, rather than the percentage of centred variance explained by PCA. I used colours to identify the clusters and circles, triangles and squares to represent Threads T1, T2 and T3. Comments appearing close together have similar positions in the 2D plot. However, reducing the data to two dimensions loses some information, so the distances between points might differ from those in the original TF-IDF matrix. For this reason, I did not rely on the scatter plot alone to judge cluster quality. I also used the silhouette scores from Question 3(b), which were calculated using the original normalised TF-IDF vectors and cosine distances. In Question 3(e), I will compare the cluster assignments with the original thread labels to see how comments from each thread are distributed across the clusters.
+
+### 5. Save the Visualisation Dataset
+
+I saved the 2D coordinates, comment IDs, cluster assignments and thread labels so the visualisation results could be reproduced.
+
+```{r q3d-save-coordinates, include=FALSE}
+# Save the aligned visualisation dataset
+readr::write_csv(
+  plot_data,
+  "Data/q3_2d_coordinates.csv"
+)
+
+# Verify saved outputs
+stopifnot(
+  file.exists("Data/q3_2d_coordinates.csv"),
+  file.exists("Data/q3_2d_clusters_threads.png")
+)
+```
+
+## Question 3e. Relationship Between Clusters and Original Threads
+
+### Purpose of the Analysis
+
+I compared the K-means clusters with the original Bluesky threads to see whether comments from the same thread were grouped together or spread across different clusters.
+
+I used the cluster assignments from Question 3(c), without applying the additional short-comment filtering.
+
+To compare Threads T1, T2 and T3, I created a contingency table, calculated percentages and used a stacked bar chart to show how comments were distributed across the clusters.
+
+### 1. Prepare the Cluster Assignments
+
+```{r q3e-prepare-data, message=FALSE, warning=FALSE}
+# Use original assignments from Question 3(c)
+cluster_assignments_e <- cluster_assignments %>%
+  mutate(
+    thread = factor(
+      as.character(thread),
+      levels = c("T1", "T2", "T3")
+    ),
+    cluster = factor(
+      as.character(cluster),
+      levels = as.character(seq_len(best_k))
+    )
+  )
+
+# Verify original comment alignment
+stopifnot(
+  nrow(cluster_assignments_e) == nrow(dtm),
+  identical(
+    as.character(cluster_assignments_e$comment_id),
+    rownames(dtm)
+  ),
+  !anyDuplicated(cluster_assignments_e$comment_id),
+  !anyNA(cluster_assignments_e$thread),
+  !anyNA(cluster_assignments_e$cluster),
+  dplyr::n_distinct(cluster_assignments_e$thread) == 3,
+  dplyr::n_distinct(cluster_assignments_e$cluster) == best_k
+)
+
+# Display dataset summary
+dataset_summary_e <- tibble(
+  Measure = c(
+    "Total comments",
+    "Original threads",
+    "K-means clusters"
+  ),
+  Value = c(
+    nrow(cluster_assignments_e),
+    n_distinct(cluster_assignments_e$thread),
+    n_distinct(cluster_assignments_e$cluster)
+  )
+)
+
+knitr::kable(
+  dataset_summary_e,
+  caption = "Dataset summary for thread-cluster analysis"
+)
+```
+
+### 2. Examine Cluster Membership Across Threads
+
+I counted how many comments from each thread belonged to each cluster.
+
+Since the threads contained different numbers of comments, I calculated percentages within each thread:
+
+$$
+P_{tj} = \frac{n_{tj}}{N_t}\times100
+$$
+
+where $n_{tj}$ is the number of comments from thread $t$ assigned to cluster $j$, and $N_t$ is the total number of comments in thread $t$.
+
+```{r q3e-contingency-table}
+# Create the thread-by-cluster contingency table
+thread_cluster_table <- table(
+  Thread = cluster_assignments_e$thread,
+  Cluster = cluster_assignments_e$cluster
+)
+
+# Display observed counts
+knitr::kable(
+  as.data.frame.matrix(thread_cluster_table),
+  caption = "Observed comment counts by thread and cluster"
+)
+
+# Calculate within-thread percentages
+thread_cluster_pct <- prop.table(
+  thread_cluster_table,
+  margin = 1
+) * 100
+
+knitr::kable(
+  round(
+    as.data.frame.matrix(thread_cluster_pct),
+    2
+  ),
+  caption = "Percentage of comments assigned to each cluster within each thread"
+)
+
+# Prepare tidy data for plotting
+thread_clusters_e <- as.data.frame(
+  thread_cluster_table
+) %>%
+  as_tibble() %>%
+  rename(
+    thread = Thread,
+    cluster = Cluster,
+    n_comments = Freq
+  ) %>%
+  group_by(thread) %>%
+  mutate(
+    percentage = 100 * n_comments / sum(n_comments)
+  ) %>%
+  ungroup()
+```
+
+### 3. Identify Dominant Clusters and Thread Concentration
+
+I identified the cluster containing the most comments from each thread.
+
+A higher percentage means more comments from the same thread were assigned to one cluster. However, if several threads share the same dominant cluster, this does not mean K-means has successfully separated the threads.
+
+```{r q3e-dominant-clusters}
+# Identify dominant cluster for each thread
+thread_summary <- thread_clusters_e %>%
+  group_by(thread) %>%
+  slice_max(
+    n_comments,
+    n = 1,
+    with_ties = FALSE
+  ) %>%
+  ungroup() %>%
+  transmute(
+    thread,
+    dominant_cluster = cluster,
+    dominant_comments = n_comments,
+    dominant_percentage = percentage
+  )
+
+# Count the clusters represented in each thread
+thread_diversity <- thread_clusters_e %>%
+  group_by(thread) %>%
+  summarise(
+    represented_clusters = sum(n_comments > 0),
+    .groups = "drop"
+  )
+
+# Combine concentration and diversity results
+thread_summary <- thread_summary %>%
+  left_join(
+    thread_diversity,
+    by = "thread"
+  )
+
+knitr::kable(
+  thread_summary,
+  digits = 2,
+  caption = "Dominant clusters and cluster diversity by original thread"
+)
+```
+
+### 4. Visualise Cluster Distribution Across Threads
+
+I used a 100% stacked bar chart to compare the cluster distribution across T1, T2 and T3.
+
+Each bar represents one thread, and the coloured sections show the percentage of comments assigned to each cluster.
+
+Using percentages makes the three threads easier to compare, even when they contain different numbers of comments.
+
+```{r q3e-thread-distribution-plot, fig.width=9, fig.height=6, fig.cap="Percentage distribution of K-means clusters across the three original Bluesky threads."}
+p_threads <- ggplot(
+  cluster_assignments_e,
+  aes(
+    x = thread,
+    fill = cluster
+  )
+) +
+  geom_bar(
+    position = "fill",
+    width = 0.7,
+    colour = "white",
+    linewidth = 0.2
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(
+      accuracy = 1
+    ),
+    breaks = seq(0, 1, 0.2),
+    expand = expansion(
+      mult = c(0, 0)
+    )
+  ) +
+  labs(
+    title = "Cluster Distribution Across Original Threads",
+    subtitle = "Proportion of comments assigned to each K-means cluster",
+    x = "Original Discussion Thread",
+    y = "Percentage of Comments",
+    fill = "K-means Cluster"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(
+      face = "bold"
+    )
+  )
+
+print(p_threads)
+
+ggsave(
+  "Data/q3_thread_cluster_distribution.png",
+  plot = p_threads,
+  width = 9,
+  height = 6,
+  dpi = 300
+)
+```
+
+### 5. Quantify the Relationship Between Threads and Clusters
+
+I used a Pearson chi-square test to check whether the original thread labels were associated with the K-means cluster assignments.
+
+The hypotheses were:
+
+$$
+H_0: \text{Cluster membership and original thread are independent.}
+$$
+
+$$
+H_1: \text{Cluster membership and original thread are associated.}
+$$
+
+The test statistic is:
+
+$$
+\chi^2 =
+\sum_{i=1}^{r}
+\sum_{j=1}^{c}
+\frac{(O_{ij}-E_{ij})^2}{E_{ij}}
+$$
+
+where $O_{ij}$ is the observed number of comments, and $E_{ij}$ is the expected number if thread labels and cluster membership are independent.
+
+I also calculated Cramér's V to measure the strength of the relationship:
+
+$$
+V =
+\sqrt{
+\frac{\chi^2}
+{N\min(r-1,c-1)}
+}
+$$
+
+Cramér's V ranges from 0 to 1. Values closer to zero indicate a weaker relationship between thread labels and cluster membership.
+
+```{r q3e-association-test, message=FALSE, warning=FALSE}
+# Perform Pearson chi-square test
+chi_result <- suppressWarnings(
+  chisq.test(
+    thread_cluster_table,
+    correct = FALSE
+  )
+)
+
+# Calculate Cramer's V
+N <- sum(thread_cluster_table)
+
+cramers_v <- sqrt(
+  as.numeric(chi_result$statistic) /
+    (
+      N * min(
+        nrow(thread_cluster_table) - 1,
+        ncol(thread_cluster_table) - 1
+      )
+    )
+)
+
+# Check expected frequencies
+small_expected <- sum(
+  chi_result$expected < 5
+)
+
+small_expected_pct <- 100 * mean(
+  chi_result$expected < 5
+)
+
+# Summarise association results
+association_results <- tibble(
+  Measure = c(
+    "Pearson chi-square statistic",
+    "Degrees of freedom",
+    "P-value",
+    "Cramer's V",
+    "Expected cells below 5 (%)"
+  ),
+  Value = c(
+    sprintf("%.4f", unname(chi_result$statistic)),
+    as.character(unname(chi_result$parameter)),
+    format.pval(chi_result$p.value, digits = 4),
+    sprintf("%.4f", cramers_v),
+    sprintf("%.2f", small_expected_pct)
+  )
+)
+
+knitr::kable(
+  association_results,
+  caption = "Association between original thread and cluster membership"
+)
+```
+
+### **Interpretation**
+
+> I compared `r nrow(cluster_assignments_e)` comments from three original threads across `r best_k` K-means clusters. The dominant cluster for Thread T1 was Cluster `r as.character(thread_summary$dominant_cluster[thread_summary$thread == "T1"])`, containing `r round(thread_summary$dominant_percentage[thread_summary$thread == "T1"], 2)`% of its comments. For Thread T2, the dominant cluster was Cluster `r as.character(thread_summary$dominant_cluster[thread_summary$thread == "T2"])`, containing `r round(thread_summary$dominant_percentage[thread_summary$thread == "T2"], 2)`%. For Thread T3, the dominant cluster was Cluster `r as.character(thread_summary$dominant_cluster[thread_summary$thread == "T3"])`, containing `r round(thread_summary$dominant_percentage[thread_summary$thread == "T3"], 2)`%. The chi-square test gave a statistic of `r round(unname(chi_result$statistic), 4)` with a p-value of `r format.pval(chi_result$p.value, digits = 4)`. `r if (chi_result$p.value < 0.05) {   "At the 5% significance level, the test indicates an association between original thread labels and cluster membership." } else {   "At the 5% significance level, the test does not provide sufficient evidence of an association between original thread labels and cluster membership." }` Cramér's V was `r round(cramers_v, 4)`, which measures how strongly the thread labels and clusters were associated. `r if (small_expected > 0) {   paste0(     "The contingency table contains ",     small_expected,     " expected cells below five (",     round(small_expected_pct, 2),     "%). The chi-square approximation should therefore be interpreted cautiously, particularly if expected frequencies are very small."   ) } else {   "All expected cell frequencies were at least five, supporting the use of the chi-square approximation." }` I used the contingency table and stacked bar chart to compare how comments from each thread were spread across the clusters. Even if the chi-square test shows an association, this does not necessarily mean K-means separated the three threads clearly. I also considered the dominant-cluster percentages and the amount of overlap between threads. The silhouette scores from Question 3(b) helped me assess how well the comments were separated based on their TF-IDF values. Since comments within the same discussion thread might be related, I treated the chi-square test as an exploratory comparison rather than definitive statistical evidence. Overall, I used these results to see whether the clusters reflected differences between the original threads or similarities in vocabulary across threads. The additional short-comment filtering analysis was kept separate to check whether comments with limited vocabulary affected the clustering results.
+
+### 6. Save the Analysis Results
+
+```{r q3e-save-results, include=FALSE}
+# Save thread-cluster distributions
+readr::write_csv(
+  thread_clusters_e,
+  "Data/q3_thread_clusters.csv"
+)
+
+# Save dominant-cluster summary
+readr::write_csv(
+  thread_summary,
+  "Data/q3_thread_summary.csv"
+)
+
+# Save association statistics
+readr::write_csv(
+  association_results,
+  "Data/q3_thread_cluster_association.csv"
+)
+
+# Verify outputs
+stopifnot(
+  file.exists("Data/q3_thread_clusters.csv"),
+  file.exists("Data/q3_thread_summary.csv"),
+  file.exists("Data/q3_thread_cluster_distribution.png")
+)
+```
+
+## Supplementary Analysis: Sensitivity to Short-Comment Filtering
+
+### Purpose of the Analysis
+
+The main clustering analysis included all comments with nonzero TF-IDF values. However, comments with only a few words might not provide enough information for meaningful clustering.
+
+I carried out an additional analysis to see whether removing comments with fewer than six terms with nonzero TF-IDF weights would affect the results.
+
+I used the same K-means settings and cosine-distance silhouette scores as in Questions 3(b) and 3(c). This was an extra check, so the original clustering results remained the main findings.
+
+This analysis is exploratory. The original clustering results remain the primary findings.
+
+### 1. Filter Comments with Limited Vocabulary
+
+I counted the number of terms with nonzero TF-IDF weights in each comment and kept only comments with at least six such terms.
+
+After filtering, I removed vocabulary columns with no remaining nonzero values and normalised the document vectors using L2-normalisation.
+
+```{r q3-supp-filter, message=FALSE, warning=FALSE}
+# Count terms with nonzero TF-IDF weights per comment
+document_lengths <- Matrix::rowSums(dtm != 0)
+
+# Retain comments with at least six nonzero-weight terms
+minimum_terms <- 6
+
+dtm_filtered <- dtm[
+  document_lengths >= minimum_terms,
+  ,
+  drop = FALSE
+]
+
+# Remove vocabulary columns without remaining weights
+dtm_filtered <- dtm_filtered[
+  ,
+  Matrix::colSums(dtm_filtered != 0) > 0,
+  drop = FALSE
+]
+
+# Verify filtered matrix
+stopifnot(
+  nrow(dtm_filtered) > 10,
+  ncol(dtm_filtered) > 0,
+  !is.null(rownames(dtm_filtered)),
+  !anyDuplicated(rownames(dtm_filtered)),
+  all(Matrix::rowSums(dtm_filtered^2) > 0)
+)
+
+# Calculate L2 norms
+filtered_norms <- sqrt(
+  Matrix::rowSums(dtm_filtered^2)
+)
+
+# Normalise filtered document vectors
+X_filtered <- as.matrix(
+  Matrix::Diagonal(
+    x = 1 / filtered_norms
+  ) %*% dtm_filtered
+)
+
+# Preserve comment identifiers
+rownames(X_filtered) <- rownames(dtm_filtered)
+
+# Verify normalisation
+stopifnot(
+  all(abs(rowSums(X_filtered^2) - 1) < 1e-8)
+)
+
+# Summarise filtering
+filter_summary <- tibble(
+  Measure = c(
+    "Original comments",
+    "Filtered comments",
+    "Excluded comments",
+    "Comments retained (%)",
+    "Original vocabulary terms",
+    "Filtered vocabulary terms"
+  ),
+  Value = c(
+    nrow(dtm),
+    nrow(dtm_filtered),
+    nrow(dtm) - nrow(dtm_filtered),
+    round(100 * nrow(dtm_filtered) / nrow(dtm), 2),
+    ncol(dtm),
+    ncol(dtm_filtered)
+  )
+)
+
+knitr::kable(
+  filter_summary,
+  caption = "Effect of short-comment filtering"
+)
+```
+
+### 2. Evaluate Filtered Clustering Solutions
+
+I ran K-means again on the filtered comments, testing values from $k=2$ to $k=10$.
+
+For each value, I used 25 random starts, a maximum of 300 iterations and a fixed seed of 42, matching the original analysis.
+
+I compared the average cosine-distance silhouette scores to see how well the filtered comments were separated. I also calculated the percentage of comments in the largest cluster to check whether one cluster contained most of the data.
+
+```{r q3-supp-evaluation, message=FALSE, warning=FALSE}
+# Calculate cosine distances
+filtered_cosine_matrix <- pmax(
+  1 - tcrossprod(X_filtered),
+  0
+)
+
+filtered_cosine_matrix <- (
+  filtered_cosine_matrix +
+    t(filtered_cosine_matrix)
+) / 2
+
+diag(filtered_cosine_matrix) <- 0
+
+filtered_cosine_dist <- stats::as.dist(
+  filtered_cosine_matrix
+)
+
+# Identify the number of distinct document vectors
+n_filtered_distinct <- nrow(
+  unique(as.data.frame(X_filtered))
+)
+
+# Restrict candidate k to supported values
+filtered_k_values <- 2:min(
+  10,
+  nrow(X_filtered) - 1,
+  n_filtered_distinct - 1
+)
+
+stopifnot(
+  length(filtered_k_values) > 0,
+  best_k %in% filtered_k_values
+)
+
+# Fit each candidate once
+filtered_models <- lapply(
+  filtered_k_values,
+  function(k) {
+
+    set.seed(42)
+
+    stats::kmeans(
+      X_filtered,
+      centers = k,
+      nstart = 25,
+      iter.max = 300
+    )
+  }
+)
+
+names(filtered_models) <- as.character(
+  filtered_k_values
+)
+
+# Evaluate the fitted models
+filtered_results <- purrr::map_dfr(
+  filtered_k_values,
+  function(k) {
+
+    model <- filtered_models[[as.character(k)]]
+
+    sil <- cluster::silhouette(
+      model$cluster,
+      filtered_cosine_dist
+    )
+
+    cluster_sizes_filtered <- table(
+      factor(
+        model$cluster,
+        levels = seq_len(k)
+      )
+    )
+
+    tibble(
+      k = k,
+      avg_silhouette = mean(
+        sil[, "sil_width"]
+      ),
+      largest_cluster_pct = 100 *
+        max(cluster_sizes_filtered) /
+        length(model$cluster),
+      total_wss = model$tot.withinss
+    )
+  }
+)
+
+# Select the highest-scoring filtered solution
+best_filtered <- filtered_results %>%
+  arrange(
+    desc(avg_silhouette),
+    k
+  ) %>%
+  slice_head(n = 1)
+
+best_filtered_k <- best_filtered$k[[1]]
+
+filtered_model <- filtered_models[[
+  as.character(best_filtered_k)
+]]
+
+filtered_sil <- cluster::silhouette(
+  filtered_model$cluster,
+  filtered_cosine_dist
+)
+
+# Display candidate results
+knitr::kable(
+  filtered_results,
+  digits = 4,
+  caption = "Silhouette evaluation of filtered K-means solutions"
+)
+```
+
+### 3. Compare Original and Filtered Results
+
+I first compared both datasets using the same number of clusters, $k=`r best_k`$, to see how filtering affected the silhouette scores.
+
+I also found the best value of $k$ for the filtered dataset separately.
+
+Since filtering changed the comments and vocabulary included in the analysis, I treated differences in silhouette scores as an indication of sensitivity rather than direct evidence of better clustering.
+
+```{r q3-supp-comparison}
+# Retrieve original results at the selected k
+original_comparison <- silhouette_results %>%
+  filter(k == best_k)
+
+# Retrieve filtered results at the same k
+filtered_comparison <- filtered_results %>%
+  filter(k == best_k)
+
+stopifnot(
+  nrow(original_comparison) == 1,
+  nrow(filtered_comparison) == 1
+)
+
+# Calculate largest cluster share for the original model
+original_largest_pct <- 100 *
+  max(table(final_kmeans$cluster)) /
+  length(final_kmeans$cluster)
+
+# Compare both datasets using the original k
+comparison_table <- tibble(
+  Dataset = c(
+    "Original comments",
+    "Filtered comments"
+  ),
+  Comments = c(
+    nrow(dtm),
+    nrow(X_filtered)
+  ),
+  Clusters = c(
+    best_k,
+    best_k
+  ),
+  Average_Silhouette = c(
+    original_comparison$avg_silhouette,
+    filtered_comparison$avg_silhouette
+  ),
+  Largest_Cluster_Pct = c(
+    original_largest_pct,
+    filtered_comparison$largest_cluster_pct
+  )
+)
+
+# Calculate descriptive difference
+silhouette_difference <-
+  filtered_comparison$avg_silhouette -
+  original_comparison$avg_silhouette
+
+knitr::kable(
+  comparison_table,
+  digits = 4,
+  caption = "Original versus filtered clustering at the same k"
+)
+
+# Summarise the independently selected filtered solution
+filtered_selection_summary <- tibble(
+  Measure = c(
+    "Original selected k",
+    "Filtered selected k",
+    "Best filtered silhouette score",
+    "Silhouette difference at original k"
+  ),
+  Value = c(
+    as.character(best_k),
+    as.character(best_filtered_k),
+    sprintf(
+      "%.4f",
+      best_filtered$avg_silhouette
+    ),
+    sprintf(
+      "%+.4f",
+      silhouette_difference
+    )
+  )
+)
+
+knitr::kable(
+  filtered_selection_summary,
+  caption = "Summary of filtered clustering results"
+)
+```
+
+### 4. Examine Filtered Clusters and Representative Comments
+
+I examined the filtered model with the highest average silhouette score.
+
+I calculated the number of comments in each cluster and selected five comments with the highest silhouette scores from each group.
+
+I used these comments to better understand the content of the filtered clusters.
+
+```{r q3-supp-diagnostics, message=FALSE, warning=FALSE}
+# Preserve filtered comment identifiers
+filtered_assignments <- tibble(
+  comment_id = rownames(X_filtered),
+  cluster = factor(
+    filtered_model$cluster,
+    levels = seq_len(best_filtered_k)
+  ),
+  silhouette = as.numeric(
+    filtered_sil[, "sil_width"]
+  )
+)
+
+# Verify assignments
+stopifnot(
+  nrow(filtered_assignments) == nrow(X_filtered),
+  identical(
+    filtered_assignments$comment_id,
+    rownames(X_filtered)
+  ),
+  !anyNA(filtered_assignments$cluster)
+)
+
+# Calculate filtered cluster sizes
+filtered_sizes <- filtered_assignments %>%
+  count(
+    cluster,
+    name = "n_comments",
+    .drop = FALSE
+  ) %>%
+  mutate(
+    percentage = round(
+      100 * n_comments / sum(n_comments),
+      2
+    )
+  )
+
+knitr::kable(
+  filtered_sizes,
+  caption = "Distribution of filtered comments across clusters"
+)
+
+# Recover original text and thread labels
+filtered_examples <- filtered_assignments %>%
+  left_join(
+    cluster_examples %>%
+      select(
+        comment_id,
+        thread,
+        text
+      ),
+    by = "comment_id"
+  )
+
+stopifnot(
+  nrow(filtered_examples) == nrow(filtered_assignments),
+  !anyNA(filtered_examples$text),
+  !anyNA(filtered_examples$thread)
+)
+
+# Select five high-silhouette comments per cluster
+representative_filtered <- filtered_examples %>%
+  group_by(cluster) %>%
+  slice_max(
+    silhouette,
+    n = 5,
+    with_ties = FALSE
+  ) %>%
+  ungroup() %>%
+  arrange(
+    cluster,
+    desc(silhouette)
+  )
+
+knitr::kable(
+  representative_filtered %>%
+    select(
+      cluster,
+      thread,
+      silhouette,
+      text
+    ),
+  digits = 4,
+  caption = "Representative comments from the filtered clusters"
+)
+```
+
+### 5. Visualise the Filtered Silhouette Results
+
+The line chart below shows the average cosine-distance silhouette scores for the filtered dataset across different values of $k$.
+
+The dashed vertical line marks the number of clusters with the highest score.
+
+```{r q3-supp-plot, fig.width=8, fig.height=5, fig.cap="Average silhouette scores for K-means clustering after excluding comments with fewer than six nonzero TF-IDF terms."}
+p_filtered <- ggplot(
+  filtered_results,
+  aes(
+    x = k,
+    y = avg_silhouette
+  )
+) +
+  geom_line(
+    linewidth = 0.8,
+    colour = "#2563A6"
+  ) +
+  geom_point(
+    size = 2.5,
+    colour = "#2563A6"
+  ) +
+  geom_vline(
+    xintercept = best_filtered_k,
+    linetype = "dashed",
+    colour = "#D1495B"
+  ) +
+  geom_point(
+    data = best_filtered,
+    size = 3.5,
+    colour = "#D1495B"
+  ) +
+  scale_x_continuous(
+    breaks = filtered_k_values
+  ) +
+  labs(
+    title = "Filtered Comment Clustering",
+    subtitle = "Average silhouette scores using cosine distance",
+    x = "Number of Clusters (k)",
+    y = "Average Silhouette Score"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p_filtered)
+
+ggsave(
+  "Data/q3_filtered_silhouette_plot.png",
+  plot = p_filtered,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```
+
+### **Interpretation**
+
+> The original dataset contained `r nrow(dtm)` comments. After removing comments with fewer than six terms with nonzero TF-IDF weights, `r nrow(X_filtered)` comments remained, representing `r round(100 * nrow(X_filtered) / nrow(dtm), 2)`% of the original dataset. Using the same number of clusters, $k=`r best_k`$, the original dataset had an average silhouette score of `r round(original_comparison$avg_silhouette, 4)` compared with `r round(filtered_comparison$avg_silhouette, 4)` for the filtered dataset. `r if (silhouette_difference > 0) {   paste0(     "The filtered dataset produced a higher average silhouette score by ",     round(silhouette_difference, 4),     " at the same number of clusters."   ) } else if (silhouette_difference < 0) {   paste0(     "The filtered dataset produced a lower average silhouette score by ",     round(abs(silhouette_difference), 4),     " at the same number of clusters."   ) } else {   "Both datasets produced the same average silhouette score at the selected number of clusters." }` When I tested the number of clusters separately for the filtered dataset, the highest average silhouette score was `r round(best_filtered$avg_silhouette, 4)` at $k=`r best_filtered_k`$. The largest filtered cluster contained `r max(filtered_sizes$n_comments)` comments, representing `r round(max(filtered_sizes$percentage), 2)`% of the remaining dataset. These results show how removing comments with limited vocabulary affected the clustering. However, a higher silhouette score does not automatically mean the filtered clusters are more reliable, since filtering changes both the comments and vocabulary used in the analysis. I kept the original clustering results from Questions 3(a) to 3(e) as the main findings. This additional analysis helped me check how sensitive the results were to short comments.
+
+### 6. Save Supplementary Results
+
+```{r q3-supp-save-results, include=FALSE}
+readr::write_csv(
+  filter_summary,
+  "Data/q3_filtered_summary.csv"
+)
+
+readr::write_csv(
+  filtered_results,
+  "Data/q3_filtered_comparison.csv"
+)
+
+readr::write_csv(
+  comparison_table,
+  "Data/q3_original_filtered_comparison.csv"
+)
+
+readr::write_csv(
+  filtered_assignments,
+  "Data/q3_filtered_assignments.csv"
+)
+
+readr::write_csv(
+  filtered_sizes,
+  "Data/q3_filtered_cluster_sizes.csv"
+)
+
+readr::write_csv(
+  representative_filtered,
+  "Data/q3_filtered_cluster_examples.csv"
+)
+
+saveRDS(
+  filtered_model,
+  "Data/q3_filtered_kmeans_model.rds"
+)
+
+stopifnot(
+  file.exists("Data/q3_filtered_comparison.csv"),
+  file.exists("Data/q3_filtered_assignments.csv"),
+  file.exists("Data/q3_filtered_silhouette_plot.png")
+)
+```

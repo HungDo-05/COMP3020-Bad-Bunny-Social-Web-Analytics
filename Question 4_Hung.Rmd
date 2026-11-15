@@ -1,0 +1,698 @@
+---
+title: "COMP3020 Social Web Analytics"
+subtitle: "Group Project - Question 4: Bluesky Network Analysis"
+author: "Do Quoc Hung - 26000219"
+date: "2026-11-14"
+output:
+  word_document:
+    toc: false
+    fig_caption: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 9, fig.height = 7, dpi = 160)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(igraph)
+library(knitr)
+```
+
+## Question 4a. Identifying the Three Most Active Bluesky Users
+
+### Methodology
+
+I used the `atrrr` package to collect Bluesky posts about Bad Bunny's Super Bowl halftime performance.
+
+I searched using four queries: `"Bad Bunny" halftime`, `"Bad Bunny" "Super Bowl"`, `"Benito" halftime`, and `"Bad Bunny"`. The searches covered posts published from 9 to 19 February 2026.
+
+For each query, I requested up to 1,000 posts, sorted from newest to oldest. I then removed duplicate posts using their URIs and excluded posts outside the selected dates.
+
+To keep the data relevant, I filtered for posts mentioning Bad Bunny or Benito along with terms related to the Super Bowl or halftime performance.
+
+Finally, I identified users by their unique DIDs and counted how many different relevant posts each user had published. I ranked the users by their post counts to find the three most active accounts.
+
+### R Code: Search Configuration
+
+```{r q4a-search-settings}
+start_date <- "2026-02-09"
+end_date <- "2026-02-20"
+
+search_queries <- c(
+  '"Bad Bunny" halftime',
+  '"Bad Bunny" "Super Bowl"',
+  '"Benito" halftime',
+  '"Bad Bunny"'
+)
+
+posts_per_query <- 1000L
+
+# Original collection used:
+# atrrr::search_post(
+#   q = query,
+#   since = start_date,
+#   until = end_date,
+#   sort = "latest",
+#   limit = posts_per_query
+# )
+```
+
+### R Code: Original Collection Results
+
+```{r q4a-load-results}
+# Load CSV files saved by the original Question 4(a) script
+search_log <- readr::read_csv(
+  "Data/q4_search_log.csv",
+  show_col_types = FALSE
+)
+
+collection_summary <- readr::read_csv(
+  "Data/q4_collection_summary.csv",
+  show_col_types = FALSE
+)
+
+top_three_users <- readr::read_csv(
+  "Data/q4_top_three_users.csv",
+  show_col_types = FALSE
+)
+```
+
+### Results
+
+The four searches returned 4,061 posts. After removing duplicates and posts outside the selected dates, 3,222 unique posts remained. I then applied the keyword filter, leaving 1,383 relevant posts from 1,194 different users. All four searches were completed successfully.
+
+```{r q4a-summary-table}
+knitr::kable(
+  collection_summary,
+  caption = "Table 1. Bluesky Post Collection Summary",
+  col.names = c("Metric", "Value")
+)
+```
+
+### Search Query Results
+
+```{r q4a-search-log}
+knitr::kable(
+  search_log,
+  caption = "Table 2. Bluesky API Search Results",
+  col.names = c(
+    "Search Query",
+    "Status",
+    "Retrieved Posts"
+  )
+)
+```
+
+The original API searches returned 1,034 records for `"Bad Bunny" halftime`, 1,016 for `"Bad Bunny" "Super Bowl"`, 968 for `"Benito" halftime`, and 1,043 for `"Bad Bunny"`.
+
+### Top Three Most Active Users
+
+```{r q4a-top-three}
+knitr::kable(
+  top_three_users %>%
+    dplyr::select(
+      rank,
+      author_handle,
+      topic_post_count
+    ),
+  caption = "Table 3. Top Three Most Active Bluesky Users",
+  col.names = c(
+    "Rank",
+    "Bluesky Account",
+    "Topic-Related Posts"
+  )
+)
+```
+
+### Discussion
+
+The most active account was `webradiomexfm.bsky.social`, with 24 relevant posts. The next two were `tmspn.bsky.social` and `chartdata.xmirror.bot`, with seven posts each. I ranked the accounts by their number of unique relevant posts and used their DIDs to break ties.
+
+These results only represent the posts collected in my dataset, rather than all activity on Bluesky. The API limits and search keywords mean some relevant posts might have been missed.
+
+I selected these three accounts for the follower network analysis in Question 4(b).
+
+## Question 4b. Constructing and Visualising the Directed Follower Network
+
+### Methodology
+
+I used the three accounts identified in Question 4(a) to build a follower network.
+
+Using the `atrrr` package, I requested up to 50 followers and 50 accounts followed by each user through `get_followers()` and `get_follows()`. If a request failed, I allowed up to three attempts.
+
+I then used `igraph` to create a directed network. Each node represents a Bluesky account, identified by its DID. Each arrow points from the account following someone to the account being followed. For example, an arrow from User A to User B means User A follows User B.
+
+Before creating the graph, I removed duplicate connections and self-loops, where an account would point to itself.
+
+I highlighted the three selected accounts in orange and displayed the other accounts in blue. I used the Fruchterman-Reingold layout to arrange the nodes in the network plot.
+
+### R Code: Network Collection
+
+The R code below shows how I originally collected the follower and following data from Bluesky.
+
+I did not run the API requests again when generating the report because the data had already been collected and saved.
+
+```{r q4b-collection-code, eval=FALSE}
+library(atrrr)
+library(tidyverse)
+library(igraph)
+
+top_users <- read_csv(
+  "Data/q4_top_three_users.csv",
+  show_col_types = FALSE
+)
+
+# API request with retries
+safe_get <- function(actor, type, limit = 50L) {
+
+  for (attempt in 1:3) {
+
+    result <- tryCatch(
+      {
+        if (type == "followers") {
+          atrrr::get_followers(
+            actor = actor,
+            limit = limit,
+            verbose = FALSE
+          )
+        } else {
+          atrrr::get_follows(
+            actor = actor,
+            limit = limit,
+            verbose = FALSE
+          )
+        }
+      },
+      error = function(e) {
+        message(
+          actor, " / ", type, ": ",
+          conditionMessage(e)
+        )
+        NULL
+      }
+    )
+
+    if (!is.null(result)) {
+      return(list(
+        data = head(result, limit),
+        status = "success"
+      ))
+    }
+
+    Sys.sleep(2^attempt)
+  }
+
+  list(
+    data = tibble(),
+    status = "failed"
+  )
+}
+
+edges_list <- list()
+request_log <- list()
+
+for (i in seq_len(nrow(top_users))) {
+
+  actor <- top_users$author_did[i]
+  handle <- top_users$author_handle[i]
+
+  for (type in c("followers", "following")) {
+
+    response <- safe_get(actor, type)
+    result <- response$data
+
+    request_log[[length(request_log) + 1]] <-
+      tibble(
+        actor = actor,
+        handle = handle,
+        type = type,
+        status = response$status,
+        retrieved = nrow(result)
+      )
+
+    if (
+      nrow(result) == 0 ||
+      !all(c("did", "actor_handle") %in% names(result))
+    ) {
+      next
+    }
+
+    if (type == "followers") {
+
+      edges <- tibble(
+        from = result$did,
+        to = actor,
+        from_handle = result$actor_handle,
+        to_handle = handle
+      )
+
+    } else {
+
+      edges <- tibble(
+        from = actor,
+        to = result$did,
+        from_handle = handle,
+        to_handle = result$actor_handle
+      )
+    }
+
+    edges_list[[length(edges_list) + 1]] <- edges
+
+    Sys.sleep(1.5)
+  }
+}
+
+log_df <- bind_rows(request_log)
+
+write_csv(
+  log_df,
+  "Data/q4_network_collection_log.csv"
+)
+
+if (length(edges_list) == 0) {
+  stop("No network edges retrieved.")
+}
+
+edges <- bind_rows(edges_list) %>%
+  filter(
+    !is.na(from),
+    !is.na(to),
+    from != to
+  ) %>%
+  distinct(from, to, .keep_all = TRUE)
+
+write_csv(
+  edges,
+  "Data/q4_network_edges.csv"
+)
+```
+
+### R Code: Constructing the Directed Network
+
+The R code below loads the saved network data and rebuilds the directed graph without making any new API requests.
+
+```{r q4b-network-graph}
+# Load original collected data
+top_users <- readr::read_csv(
+  "Data/q4_top_three_users.csv",
+  show_col_types = FALSE
+)
+
+network_edges <- readr::read_csv(
+  "Data/q4_network_edges.csv",
+  show_col_types = FALSE
+)
+
+network_log <- readr::read_csv(
+  "Data/q4_network_collection_log.csv",
+  show_col_types = FALSE
+)
+
+# Construct directed network
+g <- igraph::graph_from_data_frame(
+  network_edges %>%
+    dplyr::select(from, to),
+  directed = TRUE
+)
+
+# Remove isolated nodes, if present
+g <- igraph::delete_vertices(
+  g,
+  which(igraph::degree(g, mode = "all") == 0)
+)
+
+# Identify the three selected users
+igraph::V(g)$is_seed <-
+  igraph::V(g)$name %in% top_users$author_did
+
+# Calculate network size
+network_summary <- data.frame(
+  Metric = c("Nodes", "Directed edges"),
+  Value = c(
+    igraph::vcount(g),
+    igraph::ecount(g)
+  )
+)
+```
+
+### Results
+
+The network contained 196 nodes and 211 directed edges. All six API requests completed successfully.
+
+```{r q4b-network-summary}
+knitr::kable(
+  network_summary,
+  caption = "Table 4. Directed Bluesky Network Summary"
+)
+```
+
+### Follower and Following Retrieval
+
+```{r q4b-request-log}
+knitr::kable(
+  network_log %>%
+    dplyr::select(
+      handle,
+      type,
+      status,
+      retrieved
+    ),
+  caption = "Table 5. Follower and Following API Request Results",
+  col.names = c(
+    "Bluesky Account",
+    "Relationship",
+    "Status",
+    "Retrieved Accounts"
+  )
+)
+```
+
+For `webradiomexfm.bsky.social`, I collected 50 followers and 46 followed accounts. For `tmspn.bsky.social`, I collected 50 followers and 13 followed accounts. For `chartdata.xmirror.bot`, I collected 50 followers and two followed accounts.
+
+After removing duplicate connections and processing the data, the network contained 211 unique directed edges.
+
+### Network Visualisation
+
+```{r q4b-network-visualisation, fig.cap="Figure 1. Directed Bluesky follower network of the three most active accounts."}
+set.seed(42)
+
+plot(
+  g,
+  layout = igraph::layout_with_fr(g),
+  vertex.size = ifelse(
+    igraph::V(g)$is_seed, 12, 4
+  ),
+  vertex.color = ifelse(
+    igraph::V(g)$is_seed,
+    "#E76F51",
+    "#457B9D"
+  ),
+  vertex.label = ifelse(
+    igraph::V(g)$is_seed,
+    top_users$author_handle[
+      match(
+        igraph::V(g)$name,
+        top_users$author_did
+      )
+    ],
+    NA_character_
+  ),
+  vertex.label.cex = 0.65,
+  vertex.label.color = "black",
+  edge.arrow.size = 0.18,
+  edge.color = adjustcolor(
+    "grey45",
+    alpha.f = 0.35
+  ),
+  main = "Directed Bluesky Follower Network"
+)
+```
+
+### Discussion
+
+The network plot shows the follower and following relationships connected to the three selected accounts. I highlighted these accounts in orange to make them easier to identify.
+
+An incoming arrow means another account follows the selected user, while an outgoing arrow means the selected user follows another account.
+
+All three accounts had 50 followers retrieved because I limited the collection to 50 per user. The number of followed accounts differed, with 46 for `webradiomexfm.bsky.social`, 13 for `tmspn.bsky.social` and two for `chartdata.xmirror.bot`.
+
+The graph only represents the connections collected for this analysis, rather than the full Bluesky network. I collected the follower information in November 2026, so the relationships might have changed since the February 2026 discussion.
+
+For this reason, I treated the network as a sample of the accounts' relationships at the time of collection, rather than a complete or historical record of their connections.
+
+## Question 4c. Degree Centrality and PageRank Analysis
+
+### Methodology
+
+I used the `igraph` package to calculate centrality measures for the follower network from Question 4(b), which contained 196 accounts and 211 directed connections.
+
+I calculated four measures for each account: in-degree, out-degree, total degree and PageRank.
+
+In-degree counts how many accounts follow a user, while out-degree counts how many accounts the user follows. Total degree combines these two values.
+
+PageRank measures an account's importance based on its incoming connections and the importance of the accounts linking to it. I used a damping factor of 0.85.
+
+### R Code: Centrality Calculations
+
+```{r q4c-centrality}
+library(igraph)
+library(tidyverse)
+
+# 1. Load the original directed network
+g <- readRDS("Data/q4_network_graph.rds")
+
+top_users <- read_csv(
+  "Data/q4_top_three_users.csv",
+  show_col_types = FALSE
+)
+
+edges <- read_csv(
+  "Data/q4_network_edges.csv",
+  show_col_types = FALSE
+)
+
+# 2. Create DID-to-handle lookup
+handle_lookup <- bind_rows(
+  edges %>% transmute(
+    did = from,
+    handle = from_handle
+  ),
+  edges %>% transmute(
+    did = to,
+    handle = to_handle
+  ),
+  top_users %>% transmute(
+    did = author_did,
+    handle = author_handle
+  )
+) %>%
+  filter(
+    !is.na(did),
+    !is.na(handle),
+    handle != ""
+  ) %>%
+  distinct(did, .keep_all = TRUE)
+
+# 3. Calculate centrality measures
+centrality_results <- tibble(
+  did = V(g)$name,
+  in_degree = degree(
+    g,
+    mode = "in"
+  ),
+  out_degree = degree(
+    g,
+    mode = "out"
+  ),
+  total_degree = degree(
+    g,
+    mode = "all"
+  ),
+  pagerank = page_rank(
+    g,
+    directed = TRUE,
+    damping = 0.85
+  )$vector
+) %>%
+  left_join(
+    handle_lookup,
+    by = "did"
+  ) %>%
+  mutate(
+    handle = coalesce(handle, did)
+  ) %>%
+  select(
+    did,
+    handle,
+    in_degree,
+    out_degree,
+    total_degree,
+    pagerank
+  )
+
+# 4. Identify highest-ranking users
+top_in_degree <- centrality_results %>%
+  filter(in_degree == max(in_degree)) %>%
+  arrange(handle)
+
+top_out_degree <- centrality_results %>%
+  filter(out_degree == max(out_degree)) %>%
+  arrange(handle)
+
+top_total_degree <- centrality_results %>%
+  filter(total_degree == max(total_degree)) %>%
+  arrange(handle)
+
+top_pagerank <- centrality_results %>%
+  filter(
+    abs(pagerank - max(pagerank)) < 1e-12
+  ) %>%
+  arrange(handle)
+
+# 5. Compare highest total degree and PageRank
+same_top_user <- any(
+  top_total_degree$did %in% top_pagerank$did
+)
+
+# 6. Create top-10 rankings
+top10_degree <- centrality_results %>%
+  arrange(desc(total_degree), handle) %>%
+  slice_head(n = 10)
+
+top10_pagerank <- centrality_results %>%
+  arrange(desc(pagerank), handle) %>%
+  slice_head(n = 10)
+```
+
+### Results
+
+The three selected accounts had the same highest in-degree of 50.
+
+```{r q4c-top-centrality}
+knitr::kable(
+  centrality_results %>%
+    filter(did %in% top_users$author_did) %>%
+    arrange(desc(total_degree)) %>%
+    select(
+      handle,
+      in_degree,
+      out_degree,
+      total_degree,
+      pagerank
+    ),
+  digits = 4,
+  caption = "Table 6. Centrality Measures of the Three Selected Accounts",
+  col.names = c(
+    "Bluesky Account",
+    "In-Degree",
+    "Out-Degree",
+    "Total Degree",
+    "PageRank"
+  )
+)
+```
+
+### Highest-Ranking Accounts by Centrality Measure
+
+```{r q4c-highest-users}
+highest_users <- bind_rows(
+  top_in_degree %>%
+    mutate(metric = "In-degree"),
+  top_out_degree %>%
+    mutate(metric = "Out-degree"),
+  top_total_degree %>%
+    mutate(metric = "Total degree"),
+  top_pagerank %>%
+    mutate(metric = "PageRank")
+) %>%
+  select(
+    metric,
+    handle,
+    in_degree,
+    out_degree,
+    total_degree,
+    pagerank
+  )
+
+knitr::kable(
+  highest_users,
+  digits = 4,
+  caption = "Table 7. Highest-Ranking Accounts by Centrality Measure",
+  col.names = c(
+    "Centrality Measure",
+    "Bluesky Account",
+    "In-Degree",
+    "Out-Degree",
+    "Total Degree",
+    "PageRank"
+  )
+)
+```
+
+`webradiomexfm.bsky.social` ranked first for out-degree with 46 connections, total degree with 96 connections and PageRank with a score of approximately 0.108.
+
+### Top 10 Accounts by Total Degree
+
+```{r q4c-top10-degree}
+knitr::kable(
+  top10_degree %>%
+    select(
+      handle,
+      in_degree,
+      out_degree,
+      total_degree,
+      pagerank
+    ),
+  digits = 4,
+  caption = "Table 8. Top 10 Accounts Ranked by Total Degree",
+  col.names = c(
+    "Bluesky Account",
+    "In-Degree",
+    "Out-Degree",
+    "Total Degree",
+    "PageRank"
+  )
+)
+```
+
+### Top 10 Accounts by PageRank
+
+```{r q4c-top10-pagerank}
+knitr::kable(
+  top10_pagerank %>%
+    select(
+      handle,
+      in_degree,
+      out_degree,
+      total_degree,
+      pagerank
+    ),
+  digits = 4,
+  caption = "Table 9. Top 10 Accounts Ranked by PageRank",
+  col.names = c(
+    "Bluesky Account",
+    "In-Degree",
+    "Out-Degree",
+    "Total Degree",
+    "PageRank"
+  )
+)
+```
+
+### Comparison of Degree Centrality and PageRank
+
+```{r q4c-degree-vs-pagerank}
+comparison_result <- data.frame(
+  Comparison = "Highest total-degree and PageRank users overlap",
+  Result = same_top_user
+)
+
+knitr::kable(
+  comparison_result,
+  caption = "Table 10. Comparison of Total Degree and PageRank"
+)
+```
+
+I also compared the accounts ranked first by total degree and PageRank. The comparison returned `TRUE`, confirming that `webradiomexfm.bsky.social` ranked highest for both measures.
+
+### Discussion
+
+The centrality results show that `webradiomexfm.bsky.social` occupied the highest-ranked position in the sampled network according to total degree and PageRank. The account had 50 incoming connections and 46 outgoing connections, giving a total degree of 96. The other two selected accounts had total degrees of 63 and 52.
+
+Although the highest total-degree account also achieved the highest PageRank, the two measures assess different network properties. Degree centrality counts direct connections, while PageRank considers the importance of incoming connections. For example, `bsky.app` had a total degree of only two but ranked fourth by PageRank, with a score of approximately 0.0443. This demonstrates how an account with relatively few direct connections might achieve a higher PageRank through its position in the network.
+
+The results are limited to the sampled network. In particular, the follower retrieval limit of 50 accounts per selected user affected the observed in-degree values. Therefore, the centrality rankings describe the collected network rather than the complete Bluesky network.
+
+
+The results illustrate that `webradiomexfm.bsky.social` had the highest total degree and PageRank in the collected network.
+
+This account had 50 incoming connections and 46 outgoing connections, giving a total degree of 96. The other two selected accounts had total degrees of 63 and 52.
+
+Although the same account ranked first for both measures, degree centrality and PageRank measure different things. Degree centrality counts direct connections, while PageRank also considers the importance of accounts providing incoming connections.
+
+For instance, `bsky.app` had only two direct connections but ranked fourth in PageRank, with a score of approximately 0.0443. This displays how an account with fewer connections might still receive a relatively high PageRank score.
+
+These rankings only reflect the network I collected. Since I limited follower retrieval to 50 accounts per selected user, the observed in-degree values do not represent their full follower counts.
+
+I therefore utilised these outcomes to compare the accounts within my sample rather than their overall importance across Bluesky.

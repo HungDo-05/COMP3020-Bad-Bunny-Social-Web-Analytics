@@ -1,0 +1,143 @@
+---
+title: "The Social Pulse: Bad Bunny's Super Bowl Halftime Show"
+subtitle: "COMP3020 Social Web Analytics: Group Project, T326"
+author: "Group 6"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+# install.packages(c("tm", "SnowballC", "igraph", "knitr", "ggplot2", "tidyr", "stringr", "readr", "dplyr", "lubridate"))
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,  fig.align = "center", fig.width = 7, fig.height = 4)
+library(dplyr); library(readr); library(tidyr); library(stringr); library(lubridate)
+library(ggplot2); library(knitr); library(tm); library(SnowballC); library(igraph)
+
+set.seed(3020)
+event_time <- ymd_hms("2026-02-09 01:00:00", tz = "UTC")   # halftime start, approx. 20:00 pm ET 8 Feb
+window_days <- 6
+
+
+md_safe <- function(x) {
+  x <- iconv(gsub("\\s+", " ", x), "UTF-8", "ASCII", sub = "")
+  gsub("([\\[\\]\\\\`*_{}#$%&~^<>|])", "\\\\\\1", x, perl = TRUE)
+}
+```
+
+**Repository (data and code):** https://github.com/USERNAME/comp3020-badbunny
+
+# Data collection
+
+```{r load}
+posts_all <- read_csv("data/posts_clean.csv", show_col_types = FALSE) |>
+  mutate(created_at = as_datetime(created_at, tz = "UTC"),
+         period = factor(period, levels = c("Before", "After")))
+
+# Keep posts mainly tagged as English 
+posts <- posts_all |> filter(str_detect(coalesce(langs, ""), "\\ben\\b"))
+c(all = nrow(posts_all), english = nrow(posts))
+collection_log <- read_csv("data/collection_log.csv", show_col_types = FALSE) |>
+  # Pages often hold slightly fewer than 100 posts (hidden or deleted posts are filtered out), so a slice that stopped at the 10-page limit can show ~950 posts. Use >= 900 as capped.
+  mutate(capped = capped | n_returned >= 900)
+```
+
+All the posts were collected via Bluesky API app.bsky.feed.searchPosts (access with app password) using 2 keywords "Bad Bunny" and "halftime show" on 06/11/2026. This event is Bad Bunny's Super Bowl halftime show on 08/12/2026. This reason why this report using 6 days long for before and after periods is on 01/02/2026, Bad Bunny has won Grammy's Album of the Year, which may dillute the viral moment of the dataset. The kick-off was at 18:30 ET, so the show began around 20:00 ET, which is 1:00 UTC 09/02/2026. Every query was run for each 6 hours separately, up to 10 pages of 100 results per slice, 1 second pause between requests and automatic retries on errors of server. There are 28 of 96 slices that reach 10 pages limit, which mostly around the show; therefore, the results in busiest hours may under-counted and the true number is larger than shown in the report. Duplicated results were removed by post URI. There are `r nrow(posts)` English posts in `r nrow(posts_all)` unique posts used in this analysis (`r sum(posts$period == "Before")` Before posts and `r sum(posts$period == "After")` After posts). 
+
+There are 5 limitations in this report. First is keyword search only find posts that use phrases I listed. The halftime start time is approximate base on our research and judgement. The capped slices under count the busiest time. The "English-only" filter may drop some Spanish language interactions, and lastly, all the search results will depend on Bluesky's index.
+
+# Question 2: Text mining and topic discovery
+
+## 2a. The three most-replied posts
+
+```{r q2a}
+top3 <- read_csv("data/top3_posts.csv", show_col_types = FALSE)
+top3 |>
+  transmute(Thread = thread, Author = handle, Replies = reply_count,
+            Likes = like_count, Reposts = repost_count) |>
+  kable()
+```
+
+```{r q2a-text, results="asis", echo=FALSE}
+for (i in seq_len(nrow(top3))) {
+  cat("**", top3$thread[i], "** (@", md_safe(top3$handle[i]), "): ",
+      md_safe(top3$text[i]), "  \nURL: ", top3$url[i], "\n\n", sep = "")
+}
+```
+
+Each post and all of its replies (including replies to replies) form one discussion thread, retrieved with `app.bsky.feed.getPostThread`.
+
+```{r q2a-counts}
+replies <- read_csv("data/replies.csv", show_col_types = FALSE)
+replies |> count(thread, name = "Replies retrieved") |>
+  left_join(top3 |> select(thread, `Reply count on post` = reply_count), by = "thread") |>
+  kable()
+```
+
+> **Interpretation:** As seen in the table, the number of replies retrieved successfully in T1, T2 and T3 (285, 298, and 309 respectively) is much shorter than those that appeared in the public posts (691, 662 and 640 respectively), with only between 41% and 48% of the replies appearing in the public posts actually being retrieved. There are multiple structural and moderation reasons to this data loss in social web analytics that is experienced commonly. In particular, users often remove their own posts (particularly from polarized threads such as T1 and T3), and the platforms are moderated to hide toxic and abusive comments from the public view. Additionally, when users use their private accounts or block the collector's interaction, it will be hidden from the general public.
+>
+> The total volume is therefore lower than what is shown on the platform, but this data is not accessible, and thus forms a natural filter. The 892 retrieved replies in the resulting sample are a more representative, high-quality and publicly visible discourse for our text mining.
+
+## 2b. Word frequencies per thread
+
+```{r q2b}
+# Topic words appear in almost every reply, so they are removed to let themes show;
+# contractions lose their apostrophe after punctuation removal, hence "dont", "im".
+custom_stop <- c("bad", "bunny", "badbunny", "benito", "halftime", "show",
+                 "super", "bowl", "superbowl", "nfl",
+                 "just", "like", "get", "will", "can", "one", "also", "really",
+                 "dont", "im", "its", "ive", "youre", "thats", "cant", "doesnt",
+                 "isnt", "amp")
+
+clean_corpus <- function(text, stem = FALSE) {
+  text <- gsub("[\u2018\u2019]", "'", text)                  # curly apostrophes
+  text <- iconv(text, "UTF-8", "ASCII", sub = " ")          # drop emoji
+  corp <- VCorpus(VectorSource(text))
+  corp <- tm_map(corp, content_transformer(tolower))
+  corp <- tm_map(corp, content_transformer(function(x) gsub("https?://\\S+|www\\.\\S+", " ", x)))
+  corp <- tm_map(corp, content_transformer(function(x) gsub("@\\S+", " ", x)))
+  corp <- tm_map(corp, removeWords, stopwords("english"))
+  corp <- tm_map(corp, removePunctuation)
+  corp <- tm_map(corp, removeNumbers)
+  corp <- tm_map(corp, removeWords, custom_stop)
+  if (stem) corp <- tm_map(corp, stemDocument)
+  tm_map(corp, stripWhitespace)
+}
+
+freq <- lapply(split(replies$text, replies$thread), function(txt) {
+  tdm <- TermDocumentMatrix(clean_corpus(txt))   # default keeps words of 3+ letters
+  f <- sort(rowSums(as.matrix(tdm)), decreasing = TRUE)
+  tibble(word = names(f), freq = as.integer(f))
+}) |> bind_rows(.id = "thread")
+
+top15 <- freq |> group_by(thread) |>
+  slice_max(freq, n = 15, with_ties = FALSE) |>
+  mutate(rank = row_number()) |> ungroup()
+
+top15 |> mutate(entry = paste0(word, " (", freq, ")")) |>
+  select(rank, thread, entry) |>
+  pivot_wider(names_from = thread, values_from = entry) |>
+  kable(caption = "Top 15 words per thread (frequency)")
+```
+
+```{r q2b-chart, fig.height=5}
+ggplot(top15, aes(freq, reorder(paste(word, thread, sep = "___"), freq))) +
+  geom_col() +
+  facet_wrap(~ thread, scales = "free_y") +
+  scale_y_discrete(labels = function(x) sub("___.*", "", x)) +
+  labs(x = "Frequency", y = NULL, title = "Top 15 words in the replies of each thread")
+```
+
+## 2c. Themes
+
+> **Interpretation** 
+> The themes and words used in the original post were heavily influenced by the angle taken in the reply thread which is revealed by an analysis of the top words.
+>
+> Thread 1 (Political News Angle): Sparked by a politician's investigation of the show, the main themes are Political Controversy and the Language Debate. The discussion is very polarized and politically loaded with aggressive vocabulary ("alford", "epstein", "maga", "pathetic", "fucking") mixed with words specific to the language being used ("spanish", "lyrics").
+>
+> Thread 2 (Wholesome Anecdote Angle): Themes change completely as it is based on a story of a 70-year-old father. The words are all positive and nostalgic - "dad", "music", "righteous", "brothers", "love", "loved", "great". Though the language barrier is a theme ("understand", "spanish", "words"), they are not made into a problem that is solved by the performance's energy.
+>
+> Thread 3 (Political Opinion Angle): Given an invitation to criticize the opposing party that is offered by right wing outrage, the key themes are Partisan Criticism and Chronic Outrage. There is not a lot of discussion about the halftime show itself, but rather about the meta-commentary on how conservative they have been, such as "right", "complain", "complained", "white", "always", and "years".
+>
+> When comparing the threads, both Thread 1 and Thread 3 are very political and critical (for instance: "maga" in Thread 1, "right/complain" in Thread 3), while Thread 2 is completely different, which demostrates a wholesome approach to musical pleasure. Moreover, the separate collection of terms indicates that users are often reflecting the framing of the original author, whether it is a political threat, a happy moment or a partisan critique. Finally, the difference between the two sets of vocabulary shows that users are closely following the original author's lines of thought, as in either case "spanish" is a key word.
+

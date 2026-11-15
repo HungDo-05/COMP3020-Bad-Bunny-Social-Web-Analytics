@@ -1,0 +1,355 @@
+---
+title: "The Social Pulse: Bad Bunny's Super Bowl Halftime Show"
+subtitle: "COMP3020 Social Web Analytics: Group Project, T326"
+author: "Group 6"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+# install.packages(c("tm", "SnowballC", "igraph", "knitr", "ggplot2", "tidyr", "stringr", "readr", "dplyr", "lubridate"))
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,  fig.align = "center", fig.width = 7, fig.height = 4)
+library(dplyr); library(readr); library(tidyr); library(stringr); library(lubridate)
+library(ggplot2); library(knitr); library(tm); library(SnowballC); library(igraph)
+
+set.seed(3020)
+event_time <- ymd_hms("2026-02-09 01:00:00", tz = "UTC")   # halftime start, approx. 20:00 pm ET 8 Feb
+window_days <- 6
+
+
+md_safe <- function(x) {
+  x <- iconv(gsub("\\s+", " ", x), "UTF-8", "ASCII", sub = "")
+  gsub("([\\[\\]\\\\`*_{}#$%&~^<>|])", "\\\\\\1", x, perl = TRUE)
+}
+```
+
+**Repository (data and code):** https://github.com/USERNAME/comp3020-badbunny
+
+# Data collection
+
+```{r load}
+posts_all <- read_csv("data/posts_clean.csv", show_col_types = FALSE) |>
+  mutate(created_at = as_datetime(created_at, tz = "UTC"),
+         period = factor(period, levels = c("Before", "After")))
+
+# Keep posts mainly tagged as English 
+posts <- posts_all |> filter(str_detect(coalesce(langs, ""), "\\ben\\b"))
+c(all = nrow(posts_all), english = nrow(posts))
+collection_log <- read_csv("data/collection_log.csv", show_col_types = FALSE) |>
+  # Pages often hold slightly fewer than 100 posts (hidden or deleted posts are filtered out), so a slice that stopped at the 10-page limit can show ~950 posts. Use >= 900 as capped.
+  mutate(capped = capped | n_returned >= 900)
+```
+
+All the posts were collected via Bluesky API app.bsky.feed.searchPosts (access with app password) using 2 keywords "Bad Bunny" and "halftime show" on 06/11/2026. This event is Bad Bunny's Super Bowl halftime show on 08/12/2026. This reason why this report using 6 days long for before and after periods is on 01/02/2026, Bad Bunny has won Grammy's Album of the Year, which may dillute the viral moment of the dataset. The kick-off was at 18:30 ET, so the show began around 20:00 ET, which is 1:00 UTC 09/02/2026. Every query was run for each 6 hours separately, up to 10 pages of 100 results per slice, 1 second pause between requests and automatic retries on errors of server. There are 28 of 96 slices that reach 10 pages limit, which mostly around the show; therefore, the results in busiest hours may under-counted and the true number is larger than shown in the report. Duplicated results were removed by post URI. There are `r nrow(posts)` English posts in `r nrow(posts_all)` unique posts used in this analysis (`r sum(posts$period == "Before")` Before posts and `r sum(posts$period == "After")` After posts). 
+
+There are 5 limitations in this report. First is keyword search only find posts that use phrases I listed. The halftime start time is approximate base on our research and judgement. The capped slices under count the busiest time. The "English-only" filter may drop some Spanish language interactions, and lastly, all the search results will depend on Bluesky's index.
+
+# Question 1:
+
+## 1a. Subtopic: language debate
+
+```{r q1a}
+lang_pattern <- regex(paste("\\bspanish\\b", "\\benglish\\b", "\\blanguages?\\b", "\\btranslat\\w*","\\bsubtitle[sd]?\\b", "\\bcaptions?\\b", "\\bbilingual\\b", "\\bespa(n|\u00f1)ol\\b", "\\bunderstand\\w*\\b",
+  sep = "|"), ignore_case = TRUE)
+
+posts <- posts |>
+  mutate(subtopic = factor(if_else(str_detect(coalesce(text, ""), lang_pattern), "Subtopic", "No-Subtopic"), levels = c("Subtopic", "No-Subtopic")))
+posts |> count(subtopic) |> kable()
+```
+
+```{r q1a-validate, eval=FALSE}
+# Validation:
+validation <- posts |> filter(subtopic == "Subtopic") |>
+  slice_sample(n = 50) |> select(uri, text)
+write_csv(validation, "data/lang_validation_sample.csv")
+# Precision = share of tagged posts that are really about language
+mean(read_csv("data/lang_validation_sample.csv")$is_lang)
+```
+
+> **Interpretation:** Bad Bunny's Super Bowl halftime show is main topic and the language debate is our subtopic. This show was performed entirely in Spanish, which became one of the most discussed topic with various comments that they could not understand it and some againts this side. A post was classified as Subtopic post when its post includes at least one of related keyword in this list (Spanish, English, language(s), translat-, subtitle(s), caption(s), bilingual, español, understand), match with both normal words and capitalization word. All other posts including posts with no text were classified as No-Subtopic posts. The outcome from the code is 2,668 Subtopic posts out of 36,556 English posts (only accounted for 7.3%).
+
+To check whether our rule is worked, we manually read a random sample of 50 Subtopic posts. And the results is 47 posts were genuinely about the language of the show (which is 94% precision). The misclassified posts mostly used "understand" in non-language sense, not about language (e.g. "a choice that I truly can't understand"). The rule also miss language-related posts that not use any keyword in our list; therefore, the correct number of language post may higher than our outcome.
+
+## 1b. Chi-square test
+
+- H0: Subtopic status is independent of time period. The percentage of language-debate posts is the same for before and after show.
+
+- H1: Subtopic status is associated with time period.
+
+```{r q1b}
+tab <- table(Period = posts$period, Subtopic = posts$subtopic)
+kable(addmargins(tab), caption = "Observed counts")
+kable(round(prop.table(tab, 1), 3), caption = "Row proportions")
+
+expected <- outer(rowSums(tab), colSums(tab)) / sum(tab)
+kable(round(expected, 1), caption = "Expected counts under H0")
+
+chi_manual <- sum((tab - expected)^2 / expected)   # sum of (O - E)^2 / E
+test <- chisq.test(tab, correct = FALSE)
+chi_manual
+test
+```
+
+> **Interpretation:** Table 1 demonstrates the observed counts, table 3 shows the expected counts under H0. Before the show, there are 733 of 15,435 posts discussed about language (which accounted for only 4.7%). But after the show, this percentage rose to 9.2%, almost doubled the number before with 1,935 out of 21,121 posts. The chi-square test provides χ² = 256.64 (df = 1, p \< 0.001), a sign to reject H0 ar 5% level. A post discuessed language will depend on whether it was posted before or after the show. The outcome clearly shows that a performance using entirely Spanish turned language into a larger concern in the conservation. Before the show, language is just an expected issue. But after the show, it become the center of praise and criticism.
+
+## 1c. Twitter's chi-square score
+
+Twitter's chi-square score in this solution compared observed with expected frequencies based on historical data. The before-show is the baseline in this analysis. Because the two period before and after show contain different post numbers, the historical proportions are adjusted to the sample size of after event.
+
+```{r q1c}
+# Original counts from Question 1(b)
+before_topic <- 733
+before_total <- 15435
+
+after_topic <- 1935
+after_total <- 21121
+
+# Calculate non-subtopic posts
+before_no_topic <- before_total - before_topic
+after_no_topic <- after_total - after_topic
+
+# Expected after-event counts based on before-event proportions
+expected_topic <- after_total * before_topic / before_total
+expected_no_topic <- after_total * before_no_topic / before_total
+
+# Twitter's historical-baseline chi-square score
+twitter_chi <- 
+  (after_topic - expected_topic)^2 / expected_topic +
+  (after_no_topic - expected_no_topic)^2 / expected_no_topic
+
+# Pearson chi-square test for comparison
+contingency <- matrix(
+  c(
+    before_topic, before_no_topic,
+    after_topic, after_no_topic
+  ),
+  nrow = 2,
+  byrow = TRUE,
+  dimnames = list(
+    Period = c("Before", "After"),
+    Status = c("Subtopic", "No-Subtopic")
+  )
+)
+
+pearson_chi <- chisq.test(
+  contingency,
+  correct = FALSE
+)$statistic
+
+# Display results
+comparison <- data.frame(
+  Method = c(
+    "Pearson chi-square",
+    "Twitter historical-baseline chi-square"
+  ),
+  Chi_square = c(
+    unname(pearson_chi),
+    twitter_chi
+  )
+)
+
+knitr::kable(
+  comparison,
+  digits = 2,
+  caption = "Comparison of Pearson and Twitter Chi-square Scores"
+)
+```
+
+> **Interpretation:** Twitter's chi-square score measures the change in the number of language-related posts between before and after Bad Bunny's Super Bowl halftime show. Using the historical proportion as baseline, Twitter's chi square score indicate a dramatic grow in language discssuion. The difference between Pearson and Twitter occurs is because Twitter treats historical distribution as fixed while Person estimates expected frequencies using both periods (before and after show). So the Pearson will provide more appropriate results for testing statistical independence, whereas Twitter will assess the departure from historical topic frequencies.
+
+## 1d. Linear trend in daily post counts
+
+We used 12 consecutive 24-hour periods, six days before and six days after the event (12 complete and equal days from -6 to 5). We used simple linear regression to assess because this provides us whether the number of language-related posts about the show changed linearly overtime.
+
+We built a linear regression with dependent variable is daily English post counts on day related to show (days -6 to 5).
+
+### Daily post counts
+
+```{r q1d-daily-counts}
+# Use the cleaned English-language posts from question 1a
+# event_time and window_days are defined in the setup
+
+daily <- posts |>
+  mutate(
+    day = floor(
+      as.numeric(
+        difftime(
+          created_at,
+          event_time,
+          units = "days"
+        )
+      )
+    )
+  ) |>
+  filter(
+    day >= -window_days,
+    day < window_days
+  ) |>
+  count(day, name = "n") |>
+  tidyr::complete(
+    day = seq(
+      -window_days,
+      window_days - 1
+    ),
+    fill = list(n = 0)
+  ) |>
+  arrange(day)
+
+# Display daily counts
+knitr::kable(
+  daily,
+  col.names = c(
+    "Day Relative to Event",
+    "Number of English Posts"
+  ),
+  caption = "Table 4. Daily Bluesky Post Counts"
+)
+```
+
+### Linear regression model
+
+```{r q1d-regression}
+fit <- lm(n ~ day, data = daily) # Fit a simple linear regression model
+
+summary(fit) # Display regression results
+
+# Extract model statistics
+slope <- unname(coef(fit)["day"])
+
+r_squared <- summary(fit)$r.squared
+
+adjusted_r2 <- summary(fit)$adj.r.squared
+
+p_value <- summary(fit)$coefficients[
+  "day", "Pr(>|t|)"
+]
+
+# Create a summary table
+regression_results <- data.frame(
+  Metric = c(
+    "Slope",
+    "R-squared",
+    "Adjusted R-squared",
+    "Slope p-value"
+  ),
+  Value = c(
+    slope,
+    r_squared,
+    adjusted_r2,
+    p_value
+  )
+)
+
+knitr::kable(
+  regression_results,
+  digits = 4,
+  caption = "Table 5. Linear Regression Results"
+)
+```
+
+### Scatter plot & Fitted regression line
+
+```{r q1d-plot, fig.cap="Figure 1. Daily Bluesky post counts and fitted linear regression line."}
+ggplot(daily, aes(x = day, y = n)) +
+  geom_point(
+    size = 3,
+    color = "#2563A6"
+  ) +
+  geom_smooth(
+    method = "lm",
+    formula = y ~ x,
+    se = TRUE,
+    color = "#D1495B",
+    fill = "#F4A6AE",
+    linewidth = 1
+  ) +
+  geom_vline(
+    xintercept = -0.5,
+    linetype = "dashed",
+    color = "grey40"
+  ) +
+  ggplot2::annotate(
+    "text",
+    x = 0,
+    y = max(daily$n),
+    label = "Halftime show",
+    hjust = 0,
+    size = 3.5
+  ) +
+  scale_x_continuous(
+    breaks = -window_days:(window_days - 1)
+  ) +
+  labs(
+    title = "Daily Bluesky Posts About Bad Bunny's Halftime Show",
+    subtitle = "Simple linear regression across 12 days",
+    x = "Day Relative to Halftime Show",
+    y = "Number of English Posts per Day"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+> **Interpretation:**
+
+The positive slope is 72.3 means that there is an increase of about 72 posts per additional day accross observation period. However, this slope is not statistically significant due to p = 0.59 and the standard error of 129.7 is larger than the slope, which indicate insufficient evidence of consistent linear trend.
+
+The R-squared value R² = 0.03 means that time explains only 3% of the variation in daily posts. The negative adjusted R² = -0.0669 means that the performance of this model worse after accounting for the predictor.
+
+The data illustrate a rocket, when the number of posts is around 1,581 to 2,288 per day until three days before the show, increase to 4,774 on D-1, reach the highest point at 5,412 on D-day (3.4 times the quietest day), and decreased to 1,576 after 5 days. This pattern illustrate a temporary increase in discussion rather than increase consistently over time.
+
+Therefore, the model does not suggest a linear trend.
+
+## 1e. Limitations of a linear regression
+
+Simple linear regression assumes constant change rate over time. But the way social media work does not follow a constant flow. Its engagement depends on events, which means it will increases dramatically around major events and declines after that. With this working flow, the straight regression line cannot represent for social media engagements.
+
+### Residual analysis
+
+```{r q1e, fig.height=4}
+# Use the daily counts and regression model from Question 1d
+
+residual_data <- data.frame(
+  day = daily$day,
+  residual = resid(fit)
+)
+
+# Plot regression residuals
+ggplot(
+  residual_data,
+  aes(x = day, y = residual)
+) +
+  geom_col(
+    fill = "#457B9D",
+    width = 0.7
+  ) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    color = "grey30"
+  ) +
+  scale_x_continuous(
+    breaks = -window_days:(window_days - 1)
+  ) +
+  labs(
+    title = "Residuals of the Linear Regression Model",
+    x = "Day Relative to Halftime Show",
+    y = "Residual (Observed - Predicted Posts)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+> **Interpretation:**
+
+The residual plot shows a systematic pattern rather than random noise. The regression line overestimated both ends of the period post counts (residual decreases to -1,868 on day 5) and underestimated the days near the performance (positive residual up to +2,330 on day 0).
+
+Next, this pattern happens since the "viral" effect follows the shape rise-peak-decline that a straight line cannot follow. A straight regression line assumes constant change so it cannot represent a sudden increase in attention and then declined. For example, some peak days dominate the fit so that the regression pulled upward.
+
+Moreover, the linear regression go with the assumption independent observations; however, the social media activity on one day can strongly depends on various influences from the previous day, and it can predict impossible negative counts if extended.
+
+There are 28 search slices reached the API page limit, so the observed peak may under-counted, in the other word, it means the true spike is even sharper. Some posts might have been missed, especially during high activity time.
+
+Some alternative approaches, for example, the interrupted time-series model (allowing different levels before and after event) or a count model like Poisson regression would better examining changes related to event like viral moment.
+
+Overall, the low R-square (0.0301) and the systematic residual pattern demonstrate a simple linear refgression provides poor description of this viral event.
